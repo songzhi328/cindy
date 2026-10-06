@@ -86,6 +86,9 @@
   的术语照用，不自造译法；表里没有或拿不准的，在 `i18n/glossary.json` 加
   `status: "proposed"` 条目再讨论。门禁为 `pnpm check:i18n-glossary`，规则见
   `docs/dev-rules/engineering-conventions.md` §5.1。
+- 修改个人 IM 渠道（`apps/desktop/src/main/im/**`）或官方 hook（`hook-control/**`）的
+  找/建任务、命令、排队与插话、输入拼装、事件观察、交互、收尾或停止逻辑前，必须先读
+  `docs/dev-rules/im-turn-flow.md`（入口账本、状态清单、不变量与迁移批次）。
 - 新增或修改**任一 Telegram bot 的用户可见行为**（命令、消息呈现、收口策略、群行为、
   权限口径、附件与表情）前，必须先读能力台账 `docs/product-rules/telegram-bot-parity.md`：
   两个 bot 是两套架构，差异可以有但必须登记在表里；表里标「有意不同」的行**不要去

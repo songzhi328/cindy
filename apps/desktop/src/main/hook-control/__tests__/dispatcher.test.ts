@@ -5184,3 +5184,52 @@ describe('官方 Telegram 终稿 / 交互卡 / 命令菜单由客户端发布', 
     expect(withMenu.last('provider.commands.set')?.payload).toEqual({ provider: 'telegram', menus });
   });
 });
+
+describe('渠道 /stop 走统一明确停止', () => {
+  it('task.cancel 调 stopSessionExplicitly(与桌面 Stop 同一套清理), 不再直接 abort', async () => {
+    const fr = fakeRunner();
+    const abortSession = vi.fn(async () => undefined);
+    const stopSessionExplicitly = vi.fn(async () => undefined);
+    const d = createHookDispatcher({
+      getConnection: () => CONFIG,
+      bindings: memoryBindings(),
+      runner: fr.runner,
+      abortSession,
+      stopSessionExplicitly,
+      log: noopLog,
+    });
+    const c = collector();
+    d.handleDispatch('conn-1', dispatch(), c.send);
+    await tick();
+    const sessionId = fr.calls[0].sessionId;
+    d.cancel('conn-1', 'req-1');
+    expect(stopSessionExplicitly).toHaveBeenCalledWith(sessionId);
+    expect(abortSession).not.toHaveBeenCalled();
+    fr.finish({ status: 'error', finalText: '', errorMessage: 'aborted' });
+    await tick();
+    expect(c.last('turn.end')?.payload.status).toBe('cancelled');
+  });
+
+  it('账号边界的中止不是用户喊停: 仍走 abortSession(不暂停 Goal)', async () => {
+    const fr = fakeRunner();
+    const abortSession = vi.fn(async () => undefined);
+    const stopSessionExplicitly = vi.fn(async () => undefined);
+    const d = createHookDispatcher({
+      getConnection: () => CONFIG,
+      bindings: memoryBindings(),
+      runner: fr.runner,
+      abortSession,
+      stopSessionExplicitly,
+      log: noopLog,
+    });
+    const c = collector();
+    d.handleDispatch('conn-1', dispatch(), c.send);
+    await tick();
+    const deactivated = d.deactivateAccount();
+    await tick();
+    expect(abortSession).toHaveBeenCalledWith(fr.calls[0].sessionId);
+    expect(stopSessionExplicitly).not.toHaveBeenCalled();
+    fr.finish();
+    await deactivated;
+  });
+});

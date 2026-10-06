@@ -1567,6 +1567,34 @@ export function noteSilentStopSessionReset(sessionId: string): void {
   resetAutomaticRecoveryForExplicitStop(sessionId);
 }
 
+/** 统一明确停止的实现(coordinator 就绪后由注册流程装上)。 */
+let explicitStopImpl: ((sessionId: string) => Promise<void>) | null = null;
+
+/**
+ * 用户明确喊停的统一入口 —— 与桌面 Stop 同一套清理, 顺序固定:
+ *   1. 撤自动续跑与退避簿记(resetAutomaticRecoveryForExplicitStop);
+ *   2. 取消上下文溢出恢复;
+ *   3. 暂停 Goal(落定后才返回, 失败抛 INTERNAL);
+ *   4. coordinator.stop: 撤已排期续跑、清队列、中止当前一轮(唯一的一次 abort)并清理
+ *      待决交互;
+ *   5. 等队列快照落盘。
+ *
+ * 外部渠道(个人 IM `/stop`、官方 hook `task.cancel`)与伙伴群聊 / 委派的停止都走这里,
+ * 不再各自拼一份(见 docs/dev-rules/im-turn-flow.md 不变量 9)。调用方不要再自己
+ * `session.abort()` —— 重复中止会向 vendor 发两次 interrupt。
+ *
+ * 注册前(启动早期 / 单测)退回最小语义: 撤自动续跑 + 暂停 Goal + 中止当前一轮。
+ */
+export async function stopSessionTurnExplicitly(sessionId: string): Promise<void> {
+  if (explicitStopImpl) {
+    await explicitStopImpl(sessionId);
+    return;
+  }
+  resetAutomaticRecoveryForExplicitStop(sessionId);
+  await pauseGoalBeforeExplicitStop(sessionId);
+  await getMaker().getSession(sessionId)?.abort();
+}
+
 /**
  * silent-stop 决策结果通知:scheduler/hook runner 等 in-process 监听方无法从
  * session.onEvent 收到合成的 settle 信号,通过本回调获知非续跑决策已做出,
@@ -10380,14 +10408,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         onAccepted,
       }),
     prepareAttachments: botGroupAttachments.prepare,
-    abortLane: async (sessionId) => {
-      await inputCoordinator.ensureQueueRestored(sessionId);
-      resetAutomaticRecoveryForExplicitStop(sessionId);
-      contextOverflowRolloverHolder?.cancelRecovery(sessionId);
-      await pauseGoalBeforeExplicitStop(sessionId);
-      inputCoordinator.stop(sessionId);
-      await awaitAgentInputQueueSnapshotPersistence(sessionId);
-    },
+    abortLane: (sessionId) => stopSessionTurnExplicitly(sessionId),
     closeLanes: async (sessionIds) => {
       await Promise.all(sessionIds.map((id) => maker.closeSession(id).catch(() => undefined)));
     },
@@ -10547,14 +10568,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       }),
     discardDelegationQueuedInputs: (sessionId, delegationId) =>
       discardDelegationQueuedInputs(inputCoordinator, sessionId, delegationId, awaitAgentInputQueueSnapshotPersistence),
-    abortSession: (async (sessionId) => {
-      await inputCoordinator.ensureQueueRestored(sessionId);
-      resetAutomaticRecoveryForExplicitStop(sessionId);
-      contextOverflowRolloverHolder?.cancelRecovery(sessionId);
-      await pauseGoalBeforeExplicitStop(sessionId);
-      inputCoordinator.stop(sessionId);
-      await awaitAgentInputQueueSnapshotPersistence(sessionId);
-    }),
+    abortSession: (sessionId) => stopSessionTurnExplicitly(sessionId),
     closeSession: (sessionId) => maker.closeSession(sessionId),
     broadcastSessionCreated,
     onChanged: (payload) => {
@@ -16226,6 +16240,14 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     getPersistedClientIds: getPersistedInputClientIds,
   });
   agentInputCoordinatorHolder = inputCoordinator;
+  explicitStopImpl = async (sessionId) => {
+    await inputCoordinator.ensureQueueRestored(sessionId);
+    resetAutomaticRecoveryForExplicitStop(sessionId);
+    contextOverflowRolloverHolder?.cancelRecovery(sessionId);
+    await pauseGoalBeforeExplicitStop(sessionId);
+    inputCoordinator.stop(sessionId);
+    await awaitAgentInputQueueSnapshotPersistence(sessionId);
+  };
   setSharedTaskQueueReader((sessionId, clientId) => {
     const item = inputCoordinator.getProjection(sessionId).pendingQueue.find((pending) => pending.clientId === clientId);
     return item ? { sessionId, authorAccountId: item.sharedTaskAuthor?.accountId ?? '', state: 'pending', attachments: item.files } : undefined;

@@ -317,6 +317,13 @@ export interface HookDispatcherDeps {
    */
   abortSession?: (sessionId: string) => Promise<void>;
   /**
+   * 可选: 用户明确喊停(task.cancel)时的统一停止 —— 与桌面 Stop 同一套清理(撤自动续跑、
+   * 取消恢复、暂停 Goal、停输入队列并中止当前一轮; 生产为 maker-ipc 的
+   * stopSessionTurnExplicitly)。未注入时回落 abortSession。账号边界的中止不是用户
+   * 喊停, 仍走 abortSession(不暂停 Goal)。
+   */
+  stopSessionExplicitly?: (sessionId: string) => Promise<void>;
+  /**
    * 可选: 把 session 行置为 archived(session.archive 用; 生产为
    * patchSessionMetaInDb, 自带 sidebar 广播)。未注入时 archive 只清绑定。
    */
@@ -679,6 +686,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     buildContextPrefix,
     dialogue,
     abortSession,
+    stopSessionExplicitly,
     archiveSessionRow,
     resolveInteraction,
     subscribeUiContinuation,
@@ -3011,11 +3019,14 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       if (runningEntry !== undefined && runningEntry.connectionId === connectionId) {
         const sessionId = runningEntry.sessionId;
         cancelRequested.add(requestKey);
-        log.info(`hook task ${requestId} cancel requested (aborting session ${sessionId})`);
-        if (abortSession) {
-          void abortSession(sessionId).catch((err) => {
+        log.info(`hook task ${requestId} cancel requested (stopping session ${sessionId})`);
+        // 渠道里的 /stop 是用户明确喊停: 与桌面 Stop 同一套清理, 不只是 abort ——
+        // 否则已排期的自动续跑会在喊停后原地复活, 进行中的 Goal 也会接着跑。
+        const stop = stopSessionExplicitly ?? abortSession;
+        if (stop) {
+          void stop(sessionId).catch((err) => {
             log.warn(
-              `abortSession failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+              `hook stop failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
             );
           });
         }
