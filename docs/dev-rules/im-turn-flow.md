@@ -23,7 +23,7 @@ Telegram / Slack / X）是同一件事的两套实现：把渠道里的一条消
 | 入站 | 各渠道 adapter → `im/shared/messageHandler.ts`（微信经 `WechatTaskStore` 持久队列） | `hook-control/manager.ts` 收 `task.dispatch` → `dispatcher.handleDispatch` | 渠道适配（入站来源各自保留） |
 | 幂等与重投 | 无（个人连接无重投） | `ackHistory` / `inflightRequests` / `terminalLedger` | 渠道适配（服务端重投是 hook 的传输语义） |
 | 找任务 | `turnRunner.resolveRouteTarget`：通知回复 → `/ctr` 绑定 → 确定性 id 通道行（`sessionRepo.findActiveSession` 复活归档行） | `dispatcher.resolveTarget`：接管 sessionId → 绑定复用（每条消息按工作目录映射现场重算）→ 失效则换任务并交接 | 共用流程的「定位」骨架 + 渠道策略（台账第三节「绑定的任务失效后怎么接续」有意不同） |
-| 建任务 | `sessionRepo.createSession` 手写 upsert；`createFreshSession`（`/new`）；随后 `maker.createSession` | `session-runner` 的 `maker.createSession`；`/new` 走 `desktopSessionStorage.create` | **公共入口 `openSession`**（含模型准入），IM 专属列在 commit 回调里写；live session 由公共 bootstrap 建 |
+| 建任务 | `sessionRepo.createSession` 确定性 id upsert；`createFreshSession`（`/new` 轮换事务）；随后 `maker.createSession` —— 2026-10 起两处建行都经 `openChannelSession` → **`openSession`**（模型准入） | `session-runner` 新任务的 `maker.createSession`、`/new` 的 `desktopSessionStorage.create` —— 同样经 `openChannelSession` → **`openSession`** | **公共入口 `openSession`**（已完成，批次 2）；渠道专属建行在 commit 回调里。live session 仍各自 `maker.createSession`，未改用 register 内部的 `bootstrapSession`（会新增项目上下文 / Orca 指令注入等行为，见 §6） |
 | 默认配置 | `resolveImSessionDefaults(channel)` + 跟随渠道默认（`channelDefaultRouteSync`） | `resolveNewSessionConfig`（目录偏好 > 全局 IM 默认 > 清单首项；权限档规则见 `defaults.ts`） | 渠道策略（台账第三节「新会话的默认…从哪读」有意不同） |
 | 命令 | `messageHandler.processOne` → `slashCommands`（注册表 `botCommands.ts`） | 服务端分发命令，桌面只收 `query.*` | 渠道适配（官方命令分发在服务端） |
 | 排队与插话 | `SessionState.sendQueue`（内存、无上限、重启丢失）；无插话 | `dispatcher.queues`（内存、上限 20）+ `drainPolls`；无插话 | **公共入口 `AgentInputCoordinator`**（见 §5 批次 3 与 §6 待决项） |
@@ -110,8 +110,10 @@ inbound ──► admitted ──► queued? ──► dispatching ──► run
 1. **统一明确停止**（已完成）：`register.ts` 里重复的内联停止序列抽成导出的
    `stopSessionTurnExplicitly`（伙伴群聊 lane 与伙伴委派原来各抄一份，改调它）；IM
    `/stop`（含微信）与 hook `task.cancel` 改调它，账号边界中止仍是普通 abort。
-2. **新建任务走 `openSession`**：IM `createSession` / `createFreshSession` 与 hook 新任务
-   改经 `openSession`（模型准入），IM 专属列在 commit 回调里写；live session 经公共 bootstrap。
+2. **新建任务走 `openSession`**（已完成）：`im/shared/openChannelSession.ts` 是两侧共用的
+   薄包装 —— 准入前的路由送进 `openSession`，建行回调拿准入后的路由；IM `createSession` /
+   `createFreshSession`、hook 新任务与 `/new` 的只建行都经它。复用 / 接管 / 复活既有任务
+   不经过准入。准入拒绝时抛出，调用方走各自既有的渠道失败提示。
 3. **排队走 `AgentInputCoordinator`**：删 IM `sendQueue` 与 hook `queues`；coordinator
    队列项补 `imSource` / `hookSource` 字段（不进 `origin`），派发时由宿主重盖
    `MAIN_OWNED_SEND_CONTEXT`；hook dispatcher 按 clientId 认出自己的轮次。
@@ -127,5 +129,6 @@ inbound ──► admitted ──► queued? ──► dispatching ──► run
 | 排队消息在桌面端可见 / 可删 | 不可见 | 不可见 | 迁到 coordinator 后自然可见、可删（删除即视同撤回：IM 撤排队表情，hook 回 `turn.end(cancelled)`） |
 | 排队上限 | 无上限 | 每会话 20 | 各自保留：IM 不限，hook 仍按 20 拒收 |
 | 插话（steer） | 无 | 无 | 不新增 |
-| 模型准入（`openSession`） | 只做凭证检查 | 新任务做路由检查 | 迁移后按 `openSession` 准入拒绝（Dash 指定走公共入口；拒绝文案沿用渠道既有失败提示） |
+| 模型准入（`openSession`） | 只做凭证检查 | 新任务做路由检查 | 已按 Dash 指定改走 `openSession` 准入：新任务的模型 / 来源 / 推理强度 / Fast 不被支持时直接拒绝（文案「不会自动更换模型或供应商」），准入还会规范化来源与推理强度；渠道默认配置若指向已停用的模型，新任务会建不出来（以前会照建） |
+| live session 改走 `bootstrapSession` | 不注入项目上下文 / Orca 指令 | 同左 | 未改：改了等于给 IM / hook 任务新增项目上下文与 Orca 指令注入、目录授权准备等行为，属产品决定 |
 | 缺口 2b / 2e / 2f / 默认配置取值链 | 见台账 | 见台账 | 各自保留，合并只共享实现骨架 |

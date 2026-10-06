@@ -110,6 +110,7 @@ import { beginHeadlessGhostSetupTurn } from '../mcp-integrations/ghostSetupInter
 import { observeHookTurn, type HookTurnObserver } from './turnObserver.js';
 import { bindRuntimeRecoveryNotice } from '../im/shared/runtimeRecoveryNotice.js';
 import { beginGroupHistoryAccess } from '../im/shared/groupHistoryAccess.js';
+import { openChannelSession, type ChannelSessionRoute } from '../im/shared/openChannelSession.js';
 import { describeInteractionSource } from '../im/shared/interactionSource';
 import { groupLaneOf } from './groupWindow';
 
@@ -656,6 +657,21 @@ export function createMakerHookSessionRunner(deps: {
           : {}),
         resumeSessionId,
       };
+      // 新任务经公共入口 openSession(与桌面新建任务同一套模型准入 / Git 初始化 / 账号代次
+      // 校验, docs/dev-rules/im-turn-flow.md 批次 2); 建行本身仍是下面各自既有的路径。
+      // 准入可能规范化来源 / 推理强度, 新任务用准入后的路由。复用 / 接管不经过这里。
+      const newSessionRoute: ChannelSessionRoute = {
+        agentKind: effectiveAgentKind,
+        model: effectiveModel,
+        providerId,
+        ...(effort !== undefined ? { effort } : {}),
+        permissionMode,
+        workingDir,
+        ...(req.workspaceKind !== undefined ? { workspaceKind: req.workspaceKind } : {}),
+        ...(req.title ? { title: req.title } : {}),
+      };
+      /** 这一轮会话实际使用的来源(新任务取准入后的值)。 */
+      let sessionProviderId = providerId;
       if (req.createOnly) {
         if (!req.isNew) return fail('create-only requires a new task');
         try {
@@ -664,19 +680,26 @@ export function createMakerHookSessionRunner(deps: {
           // into a slow websocket RPC and can leave server/client state split
           // if the response times out. The first real message cold-opens this
           // same row through the ordinary reuse path.
-          await desktopSessionStorage.create({
-            id: req.sessionId,
-            agentKind: effectiveAgentKind,
-            workDir: workingDir,
-            title: req.title ?? 'New task',
-            model: effectiveModel,
-            ...(req.workspaceKind !== undefined ? { workspaceKind: req.workspaceKind } : {}),
-            ...(effort !== undefined ? { effort } : {}),
-            permissionMode,
-          });
-          if (providerId) {
-            setSessionProvider(req.sessionId, providerId);
-            await setSessionProviderIdInDb(req.sessionId, providerId);
+          const admittedProviderId = await openChannelSession(
+            req.sessionId,
+            newSessionRoute,
+            async (admitted) => {
+              await desktopSessionStorage.create({
+                id: req.sessionId,
+                agentKind: effectiveAgentKind,
+                workDir: workingDir,
+                title: req.title ?? 'New task',
+                model: admitted.model,
+                ...(req.workspaceKind !== undefined ? { workspaceKind: req.workspaceKind } : {}),
+                ...(admitted.effort !== undefined ? { effort: admitted.effort } : {}),
+                permissionMode,
+              });
+              return admitted.providerId;
+            },
+          );
+          if (admittedProviderId) {
+            setSessionProvider(req.sessionId, admittedProviderId);
+            await setSessionProviderIdInDb(req.sessionId, admittedProviderId);
           }
           if (req.source?.im === 'telegram' || req.source?.im === 'x') {
             await setSessionSourceInDb(req.sessionId, req.source.im);
@@ -704,7 +727,17 @@ export function createMakerHookSessionRunner(deps: {
       }
       try {
         await prepareUnhealthySessionForSend(req.sessionId);
-        session = await maker.createSession(createOpts);
+        session = req.isNew
+          ? await openChannelSession(req.sessionId, newSessionRoute, (admitted) => {
+              sessionProviderId = admitted.providerId;
+              return maker.createSession({
+                ...createOpts,
+                model: admitted.model,
+                ...(admitted.providerId !== null ? { providerId: admitted.providerId } : {}),
+                ...(admitted.effort !== undefined ? { effort: admitted.effort } : {}),
+              });
+            })
+          : await maker.createSession(createOpts);
       } catch (err) {
         // session 未建成: 若有预建 worktree 则回收(同 maker-ipc/register.ts
         // 的 shouldRecycleHandoffWorktreeOnFailure 判据), 防孤儿泄漏
@@ -751,7 +784,7 @@ export function createMakerHookSessionRunner(deps: {
       // 新建显式 set(与 scheduler 4.4.2 的显式 providerId 分支同款); 复用走
       // hydrate —— 仅内存无条目时写入, 不覆盖运行中会话刚在聊天里切的更新值。
       if (req.isNew) {
-        if (providerId) setSessionProvider(session.id, providerId);
+        if (sessionProviderId) setSessionProvider(session.id, sessionProviderId);
       } else {
         hydrateSessionProvider(session.id, rowProviderId);
       }
@@ -879,8 +912,8 @@ export function createMakerHookSessionRunner(deps: {
         // 来源落库也在广播前: DesktopSessionStorage.create 不写 provider_id,
         // 不补的话 renderer 重拉 / 冷 resume 的 hydrate funnel 读到的来源恒空
         // (issue #854)。失败仅 warn(helper 内部吞错), 运行时路由不受影响。
-        if (providerId) {
-          await setSessionProviderIdInDb(session.id, providerId);
+        if (sessionProviderId) {
+          await setSessionProviderIdInDb(session.id, sessionProviderId);
         }
         if (req.source?.im === 'telegram' || req.source?.im === 'x') {
           await setSessionSourceInDb(session.id, req.source.im);

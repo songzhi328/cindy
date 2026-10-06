@@ -87,6 +87,23 @@ const h = vi.hoisted(() => {
   };
 });
 
+// 新任务经公共入口 openSession(模型准入)—— 准入本身由 sessionOpening 的测试覆盖, 这里
+// 只把准入前的路由原样透传给建行回调。
+vi.mock('../../localDb/sessionOpening.js', () => ({
+  openSession: vi.fn(
+    async (
+      input: { body: Record<string, unknown> },
+      commit?: (row: Record<string, unknown>, assertCurrent: () => void) => Promise<unknown>,
+    ) => {
+      const row = {
+        ...input.body,
+        providerId: input.body.providerId ?? null,
+        fastMode: !!input.body.fastMode,
+      };
+      return { row, value: commit ? await commit(row, () => undefined) : undefined };
+    },
+  ),
+}));
 vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => [] },
 }));
@@ -601,6 +618,35 @@ describe('hook session-runner 的 userSendAt 时序(未分类误判回归)', () 
     expect(h.createMessage).not.toHaveBeenCalled();
     expect(h.calls).toEqual(expect.arrayContaining(['touch:sess-new', 'created:sess-new']));
     expect(h.touchUserSendInDb).toHaveBeenCalledTimes(1);
+  });
+
+  it('新任务经 openSession 准入: 首条消息与 /new 都用准入后的路由建任务', async () => {
+    const { openSession } = await import('../../localDb/sessionOpening.js');
+    const admit = async (input: { body: Record<string, unknown> }, commit?: (row: Record<string, unknown>, assertCurrent: () => void) => Promise<unknown>) => {
+      const row = { ...input.body, model: 'admitted-model', providerId: 'admitted-provider', fastMode: false };
+      return { row, value: commit ? await commit(row, () => undefined) : undefined };
+    };
+    vi.mocked(openSession).mockImplementationOnce(admit as never).mockImplementationOnce(admit as never);
+    const runner = createMakerHookSessionRunner({ log });
+
+    await runner.run(baseReq({}));
+    expect(vi.mocked(openSession).mock.calls.at(-1)?.[0]).toMatchObject({ id: 'sess-new', body: { model: 'test-model' } });
+    expect(fakeMaker.createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'sess-new', model: 'admitted-model', providerId: 'admitted-provider' }),
+    );
+
+    await runner.run(baseReq({ createOnly: true }));
+    expect(h.createSessionRow).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'sess-new', model: 'admitted-model' }),
+    );
+  });
+
+  it('复用既有任务不经过准入(冷 resume 按库里的路由)', async () => {
+    const { openSession } = await import('../../localDb/sessionOpening.js');
+    vi.mocked(openSession).mockClear();
+    const runner = createMakerHookSessionRunner({ log });
+    await runner.run(baseReq({ isNew: false }));
+    expect(openSession).not.toHaveBeenCalled();
   });
 
   it('createOnly keeps the durable task when userSendAt enrichment fails', async () => {
