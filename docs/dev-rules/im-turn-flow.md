@@ -114,18 +114,23 @@ inbound ──► admitted ──► queued? ──► dispatching ──► run
    薄包装 —— 准入前的路由送进 `openSession`，建行回调拿准入后的路由；IM `createSession` /
    `createFreshSession`、hook 新任务与 `/new` 的只建行都经它。复用 / 接管 / 复活既有任务
    不经过准入。准入拒绝时抛出，调用方走各自既有的渠道失败提示。
-3. **排队走 `AgentInputCoordinator`**：删 IM `sendQueue` 与 hook `queues`；coordinator
-   队列项补 `imSource` / `hookSource` 字段（不进 `origin`），派发时由宿主重盖
-   `MAIN_OWNED_SEND_CONTEXT`；hook dispatcher 按 clientId 认出自己的轮次。
-4. **共用一轮流程骨架**：把「定位 → 拼装 → 发送 → 观察 → 收口」抽成共用模块，两侧只注入
+3. **排队走 `AgentInputCoordinator`**（2026-10-06 Dash 决定另开 PR，先出设计说明）：删 IM
+   `sendQueue` 与 hook `queues`；coordinator 队列项补 `imSource` / `hookSource` 字段（不进
+   `origin`），派发时由宿主补渠道说明并重盖 `MAIN_OWNED_SEND_CONTEXT`；hook dispatcher 按
+   clientId 认出自己的轮次。**已查明的前提**：coordinator 派发一项时接管的是整轮生命周期
+   （发送事务里落库用户消息、绑定 vendor turn、出错时套用中断自动续跑 / 错误横幅 / 上下文
+   恢复），所以「只当候车室、轮到时转回渠道自己发」做不干净 —— 迁移后渠道轮次就是
+   coordinator 轮次，§6 前四行的可见变化要逐条定下来再动手。
+4. **共用一轮流程骨架**（随批次 3 另开 PR）：把「定位 → 拼装 → 发送 → 观察 → 收口」抽成共用模块，两侧只注入
    渠道适配（入站来源、出站载体、§1 标注的策略参数）。
-5. **交互挂起表合一**、**台账缺口收敛**：缺口的最终取向逐项写回台账，用户可见变化按 §6 处理。
+5. **交互挂起表合一**、**台账缺口收敛**（随批次 3 另开 PR）：缺口的最终取向逐项写回台账，用户可见变化按 §6 处理。
 
 ## 6. 待 Dash 决定（默认保持各自现状）
 
 | 项 | 个人 IM 现状 | 官方 hook 现状 | 合并后若不决定 |
 |---|---|---|---|
-| 重启后排队消息 | 丢失 | 服务端按未 ack 重投 | coordinator 快照会恢复为**暂停**队列；迁移时对 IM 来源项在恢复时丢弃，保持现状 |
+| 重启后排队消息 | 丢失 | 已 ack 为 queued 的任务丢失，服务端靠 lease 超时收口 | coordinator 快照会恢复为**暂停**队列，等用户再发消息才继续 |
+| 渠道轮次的中断自动续跑 / 错误横幅 / 上下文恢复 | 无 | 无 | 迁到 coordinator 后自然覆盖（与桌面同语义）；与 `maker-core-and-agent-behavior.md` 「IM 绑定任务不进图片历史自动恢复」那条要一并核对 |
 | 排队消息在桌面端可见 / 可删 | 不可见 | 不可见 | 迁到 coordinator 后自然可见、可删（删除即视同撤回：IM 撤排队表情，hook 回 `turn.end(cancelled)`） |
 | 排队上限 | 无上限 | 每会话 20 | 各自保留：IM 不限，hook 仍按 20 拒收 |
 | 插话（steer） | 无 | 无 | 不新增 |

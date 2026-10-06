@@ -372,8 +372,8 @@ export function createOfficialTelegramTurnCarrier(
         kind: 'media',
         album: group.album,
         items: group.items.map((item, index) => ({
-          // 协议要求非空文件名; 出站附件缺名时按段内序号命名(与 desktop 入站落盘同一习惯)。
-          name: item.name || `attachment-${part}-${index + 1}`,
+          // 协议要求非空文件名(服务端上限 256 字); 出站附件缺名时按段内序号命名。
+          name: (item.name || `attachment-${part}-${index + 1}`).slice(0, 256),
           mimeType: item.mimeType,
           dataBase64: item.dataBase64,
         })),

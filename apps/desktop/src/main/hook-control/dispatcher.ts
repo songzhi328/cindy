@@ -984,7 +984,10 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     requestId: string,
     externalKey: string,
     legacy: OfficialTelegramCardPublisherDeps['legacy'],
-  ): OfficialTelegramCardPublisherDeps['legacy'] & { drain(): Promise<void> } {
+  ): OfficialTelegramCardPublisherDeps['legacy'] & {
+    /** 等在途的发卡 / 收口编辑结束(有界), 然后不再纳入账号切换的统一停止 —— 这一轮已收口。 */
+    drain(): Promise<void>;
+  } {
     let publisher: OfficialTelegramCardPublisher | null = null;
     const clientCards = new Set<string>();
     return {
@@ -1016,7 +1019,11 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
         legacy.close(interactionId, reason);
       },
       async drain() {
-        await publisher?.drain();
+        if (!publisher) return;
+        await publisher.drain();
+        // 这一轮已收口: 从账号切换的统一停止集合里摘掉, 免得每轮一个、只增不减。
+        // 迟到的收口编辑(如共享权限在桌面端被决定)仍可经闭包里的 publisher 发出。
+        activeCardPublishers.delete(publisher);
       },
     };
   }
