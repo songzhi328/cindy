@@ -47,6 +47,7 @@ import {
   makeTurnEnd,
   makeTurnProgress,
   makeTurnReopen,
+  HOOK_FEATURE_TELEGRAM_PROGRESS_OPS,
   HOOK_FEATURE_TURN_DELIVERY,
   HOOK_FEATURE_TURN_REOPEN,
   type HookMessage,
@@ -70,6 +71,12 @@ import type { GroupHistoryAccessScope } from '../im/shared/groupHistoryAccess.js
 import { groupHistoryAccessForExternalKey } from './groupHistoryScope.js';
 import { isPathWithin } from './paths.js';
 import { createAckReactions, type AckReactionTask } from './ackReactions.js';
+import {
+  createMsgOpResultRouter,
+  createOfficialTelegramProgressCarrier,
+  isTelegramProgressOpId,
+  type OfficialTelegramProgressCarrier,
+} from './telegramProgressCarrier.js';
 import type { HookConnectionConfig } from './store.js';
 import type { HookBindingStore } from './bindings.js';
 import { terminalDeliveryExpired } from './requestLedger.js';
@@ -828,6 +835,75 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     emojiReactions: () => emojiReactionsMode,
     log,
   });
+  /** 进度 msg.op 的请求/回执配对(所有轮次共用; 回执按 opId 路由)。 */
+  const progressOpRouter = createMsgOpResultRouter();
+  /** 仍在驱动进度消息的轮次(账号切换 / dispose 时统一停下)。 */
+  const activeProgressCarriers = new Set<OfficialTelegramProgressCarrier>();
+  const closeProgressCarriers = (): void => {
+    for (const carrier of [...activeProgressCarriers]) carrier.close();
+    activeProgressCarriers.clear();
+    progressOpRouter.failAll();
+  };
+
+  /**
+   * 一轮官方 Telegram 的进度消息出口(只在 telegram 任务上建)。
+   *
+   * 双方都宣告 msg-op-v1 + telegram-progress-ops-v1 时, 首帧起由本端渲染并经
+   * msg.op 驱动(个人 bot 同一生命周期, 见 telegramProgressCarrier.ts); 否则什么都
+   * 不做, 服务端照旧渲染 turn.progress。turn.progress 由调用方**照发**(lease)。
+   *
+   * 协商按帧现查: 断线期间能力快照缺席只跳过这一帧; 新 welcome 明确不再宣告
+   * (滚动发布落到旧节点)时本轮停止 msg.op —— 旧节点会自己渲染 turn.progress。
+   */
+  function turnProgressCarrier(
+    connectionId: string,
+    requestId: string,
+    externalKey: string,
+  ): OfficialTelegramProgressCarrier {
+    let carrier: OfficialTelegramProgressCarrier | null = null;
+    let stopped = false;
+    const stop = (): void => {
+      stopped = true;
+      if (carrier) activeProgressCarriers.delete(carrier);
+    };
+    return {
+      update(markdown) {
+        if (stopped) return;
+        const features = serverFeatures.get(connectionId);
+        if (features === undefined) return;
+        if (
+          !features.includes(HOOK_FEATURE_MESSAGE_OPS) ||
+          !features.includes(HOOK_FEATURE_TELEGRAM_PROGRESS_OPS)
+        ) {
+          if (carrier) {
+            carrier.close();
+            stop();
+          }
+          return;
+        }
+        if (!carrier) {
+          carrier = createOfficialTelegramProgressCarrier({
+            connectionId,
+            requestId,
+            externalKey,
+            getSend: () => sendFns.get(connectionId),
+            router: progressOpRouter,
+            log,
+          });
+          activeProgressCarriers.add(carrier);
+        }
+        carrier.update(markdown);
+      },
+      finish() {
+        carrier?.finish();
+        stop();
+      },
+      close() {
+        carrier?.close();
+        stop();
+      },
+    };
+  }
   /**
    * 以失败收口、**还等着被续跑**的任务, 按 sessionId 记账(见协议阶段 18)。
    *
@@ -1294,6 +1370,11 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       requestId,
       entry.source,
     );
+    // 续跑轮同样由本端驱动进度消息(新建一条, 不改写被续的旧终稿 —— 那条由服务端
+    // 在终稿时原位修正, 本轮进度消息随后由服务端清理)。
+    const progressCarrier = messageLifecycle
+      ? turnProgressCarrier(entry.connectionId, requestId, entry.externalKey)
+      : null;
     let claimed = false;
     // runner 可能在 watch() 里**同步**收口(会话已不在进程里就直接 onAbandon),
     // 那时 cancelWatch 还没赋值 —— 用这个标记决定要不要登记, 不去碰它。
@@ -1335,6 +1416,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     const cleanup = (): void => {
       runningByRequest.delete(requestKey);
       cancelRequested.delete(requestKey);
+      progressCarrier?.close();
       detach();
     };
     const cancelWatch = watch({
@@ -1381,12 +1463,17 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
         if (messageLifecycle && !messageLifecycle.acceptProgress()) return;
         const send = sendFns.get(entry.connectionId);
         if (send) send(makeTurnProgress({ requestId, text }));
+        progressCarrier?.update(text);
       },
       // 停止观察即摘账 —— 成功收口还要异步收集附件, 那段时间它不该再被算作"在观察的
       // 那一轮"(否则排在后面的桌面消息一 dispatch 就被误判成顶替)。发帧的闭包照旧存活。
       onSettling: detach,
       onEnd: (outcome) => {
         const wasCancelled = cancelRequested.has(requestKey);
+        // 终稿栅栏前冲刷最新进度帧(wire 上排在 turn.end 之前); 撤销 / 换账号则不冲刷。
+        if (!revoked && claimed && isCurrentGeneration(entry.accountGeneration)) {
+          progressCarrier?.finish();
+        }
         cleanup();
         if (revoked || !claimed || !isCurrentGeneration(entry.accountGeneration)) return;
         const status: 'ok' | 'error' | 'cancelled' = wasCancelled ? 'cancelled' : outcome.status;
@@ -1472,7 +1559,10 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
         isClaimed: () => claimed,
         cancel: (silent: boolean, noRemember: boolean) => {
           // revoked 是"连迟到的帧都别发"的开关 —— 只有连接已断时才该置位。
-          if (silent) revoked = true;
+          if (silent) {
+            revoked = true;
+            progressCarrier?.close();
+          }
           if (noRemember) denyRemember = true;
           cancelWatch();
         },
@@ -1502,14 +1592,19 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       task.requestId,
       task.run.source,
     );
+    const progressCarrier = messageLifecycle
+      ? turnProgressCarrier(task.connectionId, task.requestId, task.externalKey)
+      : null;
 
     // 进度快照直发不缓存: 断线期间的中间帧没有补发价值(turn.end 会带最终
-    // 结果), 发送失败静默丢弃即可
+    // 结果), 发送失败静默丢弃即可。协商了客户端进度时 turn.progress 仍照发
+    // (服务端靠它续 lease), 进度消息本身由 progressCarrier 经 msg.op 驱动。
     const onProgress = (text: string): void => {
       if (!isCurrentGeneration(task.accountGeneration)) return;
       if (messageLifecycle && !messageLifecycle.acceptProgress()) return;
       const send = sendFns.get(task.connectionId);
       if (send) send(makeTurnProgress({ requestId: task.requestId, text }));
+      progressCarrier?.update(text);
     };
     // 交互卡同样直发不缓存: 连接不在线时用户本来就看不到卡, runner 侧的
     // 交互超时会按安全默认自决, 任务不会卡死
@@ -1618,10 +1713,14 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     runningByRequest.delete(requestKey);
     pendingGroupAdmissions.delete(requestKey);
     if (!isCurrentGeneration(task.accountGeneration)) {
+      progressCarrier?.close();
       cancelRequested.delete(requestKey);
       running.delete(sessionId);
       return;
     }
+    // 终稿栅栏之前收起本端进度载体: 冲刷最新帧(管道空闲时在 wire 上排在 turn.end
+    // 之前, 保持 done 前 flush 的语义), 之后不再发任何进度 op。
+    progressCarrier?.finish();
     // 取消收口: 无论 abort 后 runner 以 ok 还是 error 收口, 对上游统一
     // 报 cancelled(用户按下的是"停止", 中断导致的 error 不是真错误)
     const wasCancelled = cancelRequested.delete(requestKey);
@@ -2460,6 +2559,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       accountActive = false;
       accountGeneration += 1;
       clearRecoveryDeliveries();
+      closeProgressCarriers();
       if (accountDeactivation !== null) {
         await accountDeactivation;
         return;
@@ -2770,6 +2870,8 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     },
     onDisconnected(connectionId) {
       sendFns.delete(connectionId);
+      // 在等的进度回执不会再来: 立刻按"回执未知"收口(send 下一窗口原 opId 重发)。
+      progressOpRouter.failConnection(connectionId);
       for (const pending of pendingDeliveryTurnEnds.values()) {
         if (pending.connectionId !== connectionId || pending.timer === null) continue;
         clearTimeout(pending.timer);
@@ -2793,6 +2895,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     },
     dispose() {
       clearRecoveryDeliveries();
+      closeProgressCarriers();
       unsubscribeUiContinuation?.();
       unsubscribeUiIntervention?.();
       unsubscribeUiTurnDispatching?.();
@@ -2810,6 +2913,9 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       for (const key of [...pendingDeliveryTurnEnds.keys()]) clearPendingDelivery(key);
     },
     onMessageOpResult(payload: MessageOpResultPayload) {
+      // 进度操作的回执(含等待方已超时让位后的迟到回执)只归进度载体, 不落到
+      // 表情的失败日志里。
+      if (progressOpRouter.settle(payload) || isTelegramProgressOpId(payload.opId)) return;
       recoveryDeliveries.get(payload.opId)?.(payload.ok);
       // 带上按连接取发送函数的钩子: 群限制了可用表情时要用基础款回落一次,
       // 而该发到哪条连接由 ackReactions 自己记的 task 决定。

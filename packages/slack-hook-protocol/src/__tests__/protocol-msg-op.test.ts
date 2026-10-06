@@ -11,6 +11,9 @@ import { describe, it, expect } from 'vitest';
 
 import {
   HOOK_FEATURE_MESSAGE_OPS,
+  HOOK_FEATURE_TELEGRAM_PROGRESS_OPS,
+  MESSAGE_OP_ERROR_OUTCOME_UNKNOWN,
+  MESSAGE_OP_ERROR_PROGRESS_UNAVAILABLE,
   makeMessageOp,
   makeMessageOpResult,
   parseHookMessage,
@@ -125,5 +128,65 @@ describe('msg.op 动词集', () => {
     const parsed = parseHookMessage(JSON.stringify(frame));
     expect(parsed.ok).toBe(false);
     if (!parsed.ok) expect(parsed.error).toContain('unknown message type');
+  });
+});
+
+/** 拿一帧合法信封换掉 payload(只让 payload 本身决定解析结果)。 */
+function withPayload(message: HookMessage, payload: Record<string, unknown>): string {
+  const frame = JSON.parse(serializeHookMessage(message)) as Record<string, unknown>;
+  frame.payload = payload;
+  return JSON.stringify(frame);
+}
+
+describe('telegram-progress-ops-v1: 进度消息由客户端渲染、经 msg.op 驱动', () => {
+  it('能力标识与服务端同名', () => {
+    expect(HOOK_FEATURE_TELEGRAM_PROGRESS_OPS).toBe('telegram-progress-ops-v1');
+  });
+
+  it('purpose=turn-progress 的 send / edit 原样 round-trip', () => {
+    for (const action of [
+      { kind: 'send', text: '<b>x</b>', tier: 'html', silent: true },
+      { kind: 'edit', messageId: '9', text: 'x', tier: 'plain' },
+    ] as MessageOpAction[]) {
+      const parsed = roundTrip(
+        makeMessageOp({ opId: 'req-1:progress:x', requestId: 'req-1', scope: SCOPE, action, purpose: 'turn-progress' }),
+      );
+      expect(parsed.payload).toMatchObject({ purpose: 'turn-progress', requestId: 'req-1', action });
+    }
+  });
+
+  it('purpose 缺 requestId、用在非 send/edit、或取未知值一律拒收', () => {
+    const cases: Array<Record<string, unknown>> = [
+      { opId: 'a', scope: SCOPE, purpose: 'turn-progress', action: { kind: 'send', text: 'x' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'turn-progress', action: { kind: 'delete', messageId: '1' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'final', action: { kind: 'send', text: 'x' } },
+    ];
+    for (const payload of cases) {
+      const parsed = parseHookMessage(withPayload(op({ kind: 'typing' }), payload));
+      expect(parsed.ok).toBe(false);
+    }
+  });
+
+  it('不带 purpose 的 msg.op 与本能力出现前逐字相同(老帧照常解析)', () => {
+    const parsed = roundTrip(op({ kind: 'send', text: 'x' }));
+    expect((parsed.payload as { purpose?: unknown }).purpose).toBeUndefined();
+  });
+
+  it('msg.op.result 的 errorCode / channelErrorCode 可选; 类型错误拒收', () => {
+    const channel = roundTrip(
+      makeMessageOpResult({ opId: 'o', ok: false, error: "Bad Request: can't parse entities", channelErrorCode: 400 }),
+    );
+    expect(channel.payload).toMatchObject({ channelErrorCode: 400 });
+    const server = roundTrip(
+      makeMessageOpResult({ opId: 'o', ok: false, errorCode: MESSAGE_OP_ERROR_PROGRESS_UNAVAILABLE, channelErrorCode: null }),
+    );
+    expect(server.payload).toMatchObject({ errorCode: 'PROGRESS_UNAVAILABLE', channelErrorCode: null });
+    expect(MESSAGE_OP_ERROR_OUTCOME_UNKNOWN).toBe('OUTCOME_UNKNOWN');
+    for (const bad of [{ errorCode: '' }, { errorCode: 3 }, { channelErrorCode: '400' }, { channelErrorCode: 4.5 }]) {
+      const parsed = parseHookMessage(
+        withPayload(makeMessageOpResult({ opId: 'o', ok: false }), { opId: 'o', ok: false, ...bad }),
+      );
+      expect(parsed.ok).toBe(false);
+    }
   });
 });

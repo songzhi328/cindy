@@ -515,6 +515,25 @@ handler 无 sender 依赖；不加入共享任务访客白名单，不进入自�
 
 ## 1. 两仓本地协议演进
 
+### 官方 Telegram 进度消息由客户端渲染（`telegram-progress-ops-v1`）
+
+双向能力，只在 telegram 连接上声明，且必须与 `msg-op-v1` 同时协商。协商后桌面端用与个人
+bot 同一份过程载体与渲染（见 `docs/product-rules/telegram-bot-parity.md` 第一节）经
+`msg.op` 驱动进度消息；服务端只执行，`turn.progress` 照发但只用于续 lease（私聊草稿模式
+例外，仍由服务端按 `turn.progress` 出草稿）。全部为可选字段增量：
+
+- `MessageOpPayload.purpose?: 'turn-progress'`：有它时 `requestId` 必填，只用于
+  `send` / `edit`（parse 强制）。服务端据 requestId 核验设备归属，把新消息登记为该轮进度
+  消息，终稿后照旧清理；本轮不归客户端承载或已收口时回 `PROGRESS_UNAVAILABLE`。
+- `MessageOpResultPayload.errorCode?: string | null`：服务端自判拒绝码（开放集合，常量
+  `MESSAGE_OP_ERROR_*`）；`channelErrorCode?: number | null`：Telegram 原生 error_code
+  原样透传，`error` 放渠道原文。
+- 幂等：服务端按 opId + 内容指纹去重；回执未知（含 `OUTCOME_UNKNOWN`）时客户端原样重发
+  同 opId 同正文，不换号、不换正文。
+
+任一侧缺席时行为与本能力出现前逐字相同；无数据库迁移、Mobile 冷更或部署顺序要求。实现见
+`hook-control/telegramProgressCarrier.ts` 与 `packages/lizi-im/src/telegram/outboundPolicy.ts`。
+
 ### X 回复链的结构化输入
 
 服务端负责 X 事件、账号绑定、真实回复链读取与预算、可靠派发和回传；Desktop 的

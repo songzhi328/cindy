@@ -1449,7 +1449,85 @@ export interface MessageOpPayload {
   requestId?: string;
   scope: MessageOpScope;
   action: MessageOpAction;
+  /**
+   * 这次操作在 turn 里承担什么角色(可选; 缺席 = 普通独立操作, 与本字段出现前
+   * 的语义逐字相同)。目前只有 `'turn-progress'`, 见 MessageOpPurpose。
+   */
+  purpose?: MessageOpPurpose;
 }
+
+/**
+ * msg.op 的角色标记。
+ *
+ * `'turn-progress'`: 驱动 `requestId` 那一轮的**进度消息**(客户端渲染的运行中
+ * 过程消息)。仅在双方协商 HOOK_FEATURE_TELEGRAM_PROGRESS_OPS 后使用, 且必须带
+ * `requestId`(parse 强制)。只用于 `send` / `edit`, `tier` 显式给 html / plain,
+ * 不带按钮。服务端语义:
+ *   - `send`: 核验 requestId 是该设备在 scope.externalKey 上**仍在运行**的一轮,
+ *     把新建的消息登记为这一轮的进度消息(与旧 turn.progress 渲染登记的是同一个
+ *     位置) —— 终稿仍由服务端按 turn.end 发布, 发布后照旧清理它(续跑轮: 原位
+ *     修正旧终稿后清理本轮进度消息)。投递位置的副作用照旧由服务端负责: topic 由
+ *     lane 记录取, `replyToMessageId` 缺席时按这一轮的「回复引用」策略挂到触发
+ *     消息(含 `first` 档的消耗记账, 与旧进度消息逐字相同), `silent` 对应
+ *     disable_notification;
+ *   - `edit`: messageId 必须是这一轮登记过的进度消息;
+ *   - 这一轮已收口 / 不认识 / 不属于该设备, 或这条 lane 的进度由服务端自己承载
+ *     (私聊草稿 `TELEGRAM_DM_DRAFT_ENABLED`)时, 不调用 Bot API, 回
+ *     `ok=false, errorCode=MESSAGE_OP_ERROR_PROGRESS_UNAVAILABLE`; 客户端据此
+ *     停止本轮进度操作。
+ *
+ * 幂等: 服务端按 opId + 内容指纹去重, **同一 opId 配不同内容**回
+ * `MESSAGE_OP_ERROR_IDEMPOTENCY_CONFLICT`。所以回执未知时客户端必须原样重发
+ * (同 opId 同正文), 不得沿用 opId 换正文。
+ */
+export type MessageOpPurpose = 'turn-progress';
+
+/*
+ * msg.op.result.errorCode: 服务端**自己**判定的拒绝(未调用 Bot API, 或调用结果
+ * 未知)。开放集合, 客户端只按码分支、不解析 error 文本; 不认识的码按"明确失败"
+ * 处理。渠道 API 的拒绝不在这里, 走 channelErrorCode。
+ */
+/** 本轮进度不由客户端承载(私聊草稿 / 本轮已收口或不属于该设备)。客户端停止本轮进度 op。 */
+export const MESSAGE_OP_ERROR_PROGRESS_UNAVAILABLE = 'PROGRESS_UNAVAILABLE';
+/** 参数不在执行器支持范围内(契约错误)。客户端停止本轮同类 op, 不重试。 */
+export const MESSAGE_OP_ERROR_UNSUPPORTED_PARAMETERS = 'UNSUPPORTED_PARAMETERS';
+/** edit / delete 的 messageId 不属于该 lane / 该轮。客户端停止对这条消息的操作。 */
+export const MESSAGE_OP_ERROR_MESSAGE_NOT_OWNED = 'MESSAGE_NOT_OWNED';
+/** 设备的绑定已撤销或换代。客户端停止本轮 op。 */
+export const MESSAGE_OP_ERROR_BINDING_REVOKED = 'BINDING_REVOKED';
+/** 服务端限速队列拒收; 带 retryAfterMs, 客户端按它退避(与渠道 429 同处理)。 */
+export const MESSAGE_OP_ERROR_RATE_LIMITED = 'RATE_LIMITED';
+/** 同一 opId 配了不同内容。客户端的幂等记账出错, 按明确失败处理。 */
+export const MESSAGE_OP_ERROR_IDEMPOTENCY_CONFLICT = 'IDEMPOTENCY_CONFLICT';
+/** 服务端幂等记账已满, 拒收新操作(不淘汰旧回执)。明确未执行, 可换 opId 稍后再试。 */
+export const MESSAGE_OP_ERROR_CAPACITY_REACHED = 'CAPACITY_REACHED';
+/**
+ * 已调用渠道 API 但拿不到确定结果(网络中断 / 5xx / 回执异常), 消息**可能已经落地**。
+ * 客户端不得换 opId 重发同一内容: 只能原样重发同一 opId 对账。
+ */
+export const MESSAGE_OP_ERROR_OUTCOME_UNKNOWN = 'OUTCOME_UNKNOWN';
+/** 渠道已执行但服务端登记失败(服务端已尽力撤回该消息)。明确失败, 可换 opId 重试。 */
+export const MESSAGE_OP_ERROR_PERSIST_FAILED = 'PERSIST_FAILED';
+
+/**
+ * 双向能力标识: 官方 Telegram 的运行中进度消息改由 desktop 渲染、经
+ * `msg.op`(`purpose: 'turn-progress'`)驱动。必须与 HOOK_FEATURE_MESSAGE_OPS
+ * 同时协商; 只在 telegram provider 的连接上声明。
+ *
+ * 协商后的分工(内容面在客户端, 投递面在服务端):
+ *   - desktop 用与个人 bot 同一份渲染(@cindy/im `renderTelegramProgressFrame`)
+ *     生成 HTML, 首帧 `send`、后续 `edit`; HTML 被拒(`channelErrorCode=400`)
+ *     本地回落 `tier: 'plain'`, `message is not modified` 视为成功, 429 按
+ *     `retryAfterMs` 节流并合并到最新帧;
+ *   - desktop **照发** turn.progress(服务端靠它续 turn lease), 但服务端**不再
+ *     用它渲染**进度消息 —— 唯一例外是服务端仍自己承载进度的私聊草稿模式
+ *     (此时进度 msg.op 回 PROGRESS_UNAVAILABLE, 服务端继续按 turn.progress 出草稿);
+ *   - 终稿发布、进度消息清理、离线自治仍归服务端, 不随本能力改变。
+ *
+ * 任一侧缺席: desktop 只发 turn.progress, 服务端照旧渲染, 行为与本能力出现前
+ * 逐字相同。
+ */
+export const HOOK_FEATURE_TELEGRAM_PROGRESS_OPS = 'telegram-progress-ops-v1';
 
 /**
  * msg.op.result(server -> desktop): 一次消息操作的回执。
@@ -1467,6 +1545,17 @@ export interface MessageOpResultPayload {
   messageIds?: string[];
   error?: string | null;
   retryAfterMs?: number | null;
+  /**
+   * 服务端自己判定的结构化拒绝码(开放集合; 缺席/null = 没有这类拒绝)。客户端只按
+   * 码分支, 不解析 `error` 文本。已定义: MESSAGE_OP_ERROR_PROGRESS_UNAVAILABLE。
+   */
+  errorCode?: string | null;
+  /**
+   * 渠道 API 拒绝时的**原生**错误码(Telegram `error_code`, 如 400 / 429), 服务端
+   * 原样透传、不翻译; 此时 `error` 为渠道原文 description。客户端据此做与个人 bot
+   * 同判据的回落(HTML 被拒 400 → plain)。缺席/null = 不是渠道拒绝或老服务端。
+   */
+  channelErrorCode?: number | null;
 }
 
 /**

@@ -14,6 +14,7 @@ import { setMainLocale } from '../../i18n';
 
 import {
   HOOK_FEATURE_MESSAGE_OPS,
+  HOOK_FEATURE_TELEGRAM_PROGRESS_OPS,
   HOOK_FEATURE_TURN_DELIVERY,
   HOOK_FEATURE_TURN_REOPEN,
   type HookMessage,
@@ -4844,5 +4845,137 @@ describe('官方 bot ack 表情(msg.op)', () => {
     d.handleDispatch('conn-2', telegramDispatch({ requestId: 'second-owner' }), next.send);
     await tick();
     expect(next.sent.filter((m) => m.type === 'msg.op')).toHaveLength(0);
+  });
+});
+
+describe('官方 Telegram 进度消息由客户端渲染(telegram-progress-ops-v1)', () => {
+  const PROGRESS_FEATURES = [HOOK_FEATURE_MESSAGE_OPS, HOOK_FEATURE_TELEGRAM_PROGRESS_OPS];
+  const progressOps = (sent: readonly HookMessage[]) =>
+    sent.filter(
+      (m): m is Extract<HookMessage, { type: 'msg.op' }> =>
+        m.type === 'msg.op' && m.payload.purpose === 'turn-progress',
+    );
+
+  it('未协商: 只发 turn.progress, 一帧进度 msg.op 都没有(行为与旧版相同)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fr = fakeRunner();
+      const { d } = makeDispatcher({ runner: fr.runner });
+      const c = collector();
+      d.onConnected('conn-1', c.send, [HOOK_FEATURE_MESSAGE_OPS]);
+      d.handleDispatch('conn-1', telegramDispatch(), c.send);
+      await tick();
+      fr.calls[0].onProgress!('**工作中**');
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(c.ofType('turn.progress')).toHaveLength(1);
+      expect(progressOps(c.sent)).toHaveLength(0);
+      fr.finish();
+      await tick();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('协商后: turn.progress 照发(续 lease), 进度消息首帧 send、后续 edit, done 冲刷排在 turn.end 之前', async () => {
+    vi.useFakeTimers();
+    try {
+      const fr = fakeRunner();
+      const { d } = makeDispatcher({ runner: fr.runner });
+      const c = collector();
+      d.onConnected('conn-1', c.send, PROGRESS_FEATURES);
+      d.handleDispatch('conn-1', telegramDispatch(), c.send);
+      await tick();
+      const onProgress = fr.calls[0].onProgress!;
+
+      onProgress('**工作中**');
+      expect(c.ofType('turn.progress')).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1_500);
+      const [first] = progressOps(c.sent);
+      expect(first.payload).toMatchObject({
+        requestId: 'req-1',
+        scope: { externalKey: 'telegram:group:bot:-100200:user-7:g1' },
+        action: { kind: 'send', tier: 'html', text: '<b>工作中</b>' },
+      });
+      d.onMessageOpResult({ opId: first.payload.opId, ok: true, messageId: '700' });
+      await tick();
+
+      // 最后一帧还在 1.5s 尾沿窗口里就收口: 终稿栅栏同步冲刷, wire 上先于 turn.end。
+      onProgress('**工作中**\n\n最后一帧');
+      fr.finish();
+      await tick();
+      const lastEdit = c.sent.findIndex(
+        (m) => m.type === 'msg.op' && m.payload.purpose === 'turn-progress' && m.payload.action.kind === 'edit',
+      );
+      const end = c.sent.findIndex((m) => m.type === 'turn.end');
+      expect(lastEdit).toBeGreaterThan(-1);
+      expect(lastEdit).toBeLessThan(end);
+      expect((c.sent[lastEdit] as Extract<HookMessage, { type: 'msg.op' }>).payload.action).toMatchObject({
+        kind: 'edit',
+        messageId: '700',
+      });
+
+      // 收口后迟到的进度帧 / 节流定时器不再产出任何进度 op。
+      const count = progressOps(c.sent).length;
+      onProgress('迟到');
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(progressOps(c.sent)).toHaveLength(count);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('跨轮不串消息: 下一轮从新的 send 开始, opId 按各自 requestId 派生', async () => {
+    vi.useFakeTimers();
+    try {
+      const fr = fakeRunner();
+      const { d } = makeDispatcher({ runner: fr.runner });
+      const c = collector();
+      d.onConnected('conn-1', c.send, PROGRESS_FEATURES);
+      d.handleDispatch('conn-1', telegramDispatch({ requestId: 'r-a' }), c.send);
+      await tick();
+      fr.calls[0].onProgress!('第一轮');
+      await vi.advanceTimersByTimeAsync(1_500);
+      const a = progressOps(c.sent)[0];
+      d.onMessageOpResult({ opId: a.payload.opId, ok: true, messageId: '1' });
+      fr.finish();
+      await tick();
+
+      d.handleDispatch('conn-1', telegramDispatch({ requestId: 'r-b' }), c.send);
+      await tick();
+      fr.calls[1].onProgress!('第二轮');
+      await vi.advanceTimersByTimeAsync(1_500);
+      const b = progressOps(c.sent).filter((m) => m.payload.requestId === 'r-b');
+      expect(b).toHaveLength(1);
+      expect(b[0].payload.action.kind).toBe('send');
+      expect(b[0].payload.opId.startsWith('r-b:')).toBe(true);
+      // 上一轮的迟到回执不会被这一轮认领。
+      d.onMessageOpResult({ opId: a.payload.opId, ok: true, messageId: '1' });
+      fr.calls[1].onProgress!('第二轮继续');
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(progressOps(c.sent).filter((m) => m.payload.requestId === 'r-b')).toHaveLength(1);
+      fr.finish();
+      await tick();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('Slack 任务即使连接宣告了能力也不走进度 op', async () => {
+    vi.useFakeTimers();
+    try {
+      const fr = fakeRunner();
+      const { d } = makeDispatcher({ runner: fr.runner });
+      const c = collector();
+      d.onConnected('conn-1', c.send, PROGRESS_FEATURES);
+      d.handleDispatch('conn-1', dispatch(), c.send);
+      await tick();
+      fr.calls[0].onProgress!('slack 进度');
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(progressOps(c.sent)).toHaveLength(0);
+      fr.finish();
+      await tick();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

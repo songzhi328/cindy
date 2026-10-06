@@ -31,6 +31,7 @@ import {
   HOOK_FEATURE_SESSION_PICKER,
   HOOK_FEATURE_SESSION_NEW,
   HOOK_FEATURE_SLACK_TOOLS,
+  HOOK_FEATURE_TELEGRAM_PROGRESS_OPS,
   HOOK_FEATURE_TURN_DELIVERY,
   makeBindRevoke,
   makeBindStart,
@@ -694,6 +695,9 @@ export function createHookControlManager(deps: HookControlManagerDeps): HookCont
       // 只给 Telegram 声明: msg.op 目前只有 Telegram 的执行器, X 的渲染路径
       // 不接入(#1855 的红线之一)。
       HOOK_FEATURE_MESSAGE_OPS,
+      // 运行中进度消息由客户端渲染、经 msg.op 驱动(dispatcher 的 progressOps)。
+      // 服务端同时宣告时才启用; 否则继续由服务端渲染 turn.progress。
+      HOOK_FEATURE_TELEGRAM_PROGRESS_OPS,
       HOOK_FEATURE_SESSION_NEW,
     ],
     isEnabled: () => store.get().telegramEnabled,

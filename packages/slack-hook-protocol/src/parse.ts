@@ -465,6 +465,17 @@ function validateMessageOp(p: Record<string, unknown>): string | null {
   if (!isPlainObject(p.action)) return 'msg.op.action must be an object';
   const action = p.action as Record<string, unknown>;
   const kind = action.kind;
+  if (p.purpose !== undefined) {
+    if (p.purpose !== 'turn-progress') return 'msg.op.purpose must be turn-progress when present';
+    // 进度消息按 requestId 归属到一轮(服务端据此核验设备归属并登记进度消息),
+    // 缺了它服务端无从判断这条消息归谁清理。
+    if (!isNonEmptyString(p.requestId)) {
+      return 'msg.op.requestId is required when purpose is turn-progress';
+    }
+    if (kind !== 'send' && kind !== 'edit') {
+      return 'msg.op.purpose turn-progress only applies to send/edit';
+    }
+  }
   if (kind === 'send' || kind === 'edit') {
     if (typeof action.text !== 'string') return `msg.op.action.text must be a string`;
     if (kind === 'edit' && !isNonEmptyString(action.messageId)) {
@@ -541,6 +552,16 @@ function validateMessageOpResult(p: Record<string, unknown>): string | null {
     (typeof p.retryAfterMs !== 'number' || !Number.isFinite(p.retryAfterMs) || p.retryAfterMs < 0)
   ) {
     return 'msg.op.result.retryAfterMs must be a non-negative finite number or null';
+  }
+  if (p.errorCode !== undefined && p.errorCode !== null && !isNonEmptyString(p.errorCode)) {
+    return 'msg.op.result.errorCode must be a non-empty string or null';
+  }
+  if (
+    p.channelErrorCode !== undefined &&
+    p.channelErrorCode !== null &&
+    (typeof p.channelErrorCode !== 'number' || !Number.isInteger(p.channelErrorCode))
+  ) {
+    return 'msg.op.result.channelErrorCode must be an integer or null';
   }
   return null;
 }
