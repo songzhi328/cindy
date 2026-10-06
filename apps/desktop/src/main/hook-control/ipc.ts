@@ -21,6 +21,8 @@ import { isModelVisible, visibleModelUnion } from '@cindy/model-providers';
 import { BRAND_NAME } from '@cindy/maker-shared/branding';
 
 import { createLogger } from '../logger.js';
+import { t } from '../i18n.js';
+import { buildOfficialBotCommandMenus } from '../im/shared/botCommands.js';
 import { getMaker, restartCodexAfterAuthModeChange } from '../maker-host/index.js';
 import { shutdownCodexEnvironment } from '../mcp-integrations/codexEnvironment.js';
 import { getDesktopProviderService } from '../maker-host/createDesktopProviderService.js';
@@ -550,6 +552,9 @@ function ensureInstances(): { store: SlackHookStore; manager: HookControlManager
       subscribeUiTurnDispatching: onUiTurnDispatching,
       subscribeUiTurnUndispatched: onUiTurnUndispatched,
       accountInitiallyActive: false,
+      // 官方 Telegram 命令菜单以 desktop 注册表为准(telegram-commands-v1), 按 Telegram
+      // 用户语言各渲染一份。
+      telegramCommandMenus: () => buildOfficialBotCommandMenus((key, locale) => t(key, locale)),
       log,
     });
     manager = createHookControlManager({

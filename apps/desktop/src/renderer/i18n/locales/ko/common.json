@@ -3226,7 +3226,13 @@
         "permission": "권한 모드 보기·전환",
         "settings": "프로젝트와 Agent 설정 보기",
         "ctr": "데스크톱 세션 원격 제어",
-        "exctr": "원격 제어 종료"
+        "exctr": "원격 제어 종료",
+        "workspace": "프로젝트 워크스페이스 전환",
+        "unbind": "현재 프로젝트 매핑 해제",
+        "effort": "추론 강도 선택",
+        "agent": "Agent 선택",
+        "status": "연결 상태 보기",
+        "unlink": "Telegram 연결 해제"
       },
       "behavior": {
         "title": "리액션과 인용",

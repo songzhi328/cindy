@@ -3227,7 +3227,13 @@
         "permission": "Show or switch the permission mode",
         "settings": "Show project and agent settings",
         "ctr": "Remotely control a desktop session",
-        "exctr": "Exit remote control"
+        "exctr": "Exit remote control",
+        "workspace": "Switch project workspace",
+        "unbind": "Clear the current project mapping",
+        "effort": "Choose reasoning effort",
+        "agent": "Choose an Agent",
+        "status": "Show link status",
+        "unlink": "Unlink Telegram"
       },
       "behavior": {
         "title": "Reactions & quoting",

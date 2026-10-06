@@ -532,7 +532,26 @@ bot 同一份过程载体与渲染（见 `docs/product-rules/telegram-bot-parity
   同 opId 同正文，不换号、不换正文。
 
 任一侧缺席时行为与本能力出现前逐字相同；无数据库迁移、Mobile 冷更或部署顺序要求。实现见
-`hook-control/telegramProgressCarrier.ts` 与 `packages/lizi-im/src/telegram/outboundPolicy.ts`。
+`hook-control/telegramTurnCarrier.ts`、`telegramMsgOp.ts` 与
+`packages/lizi-im/src/telegram/outboundPolicy.ts`。
+
+同一轴上另有三个独立协商的能力（都要求同时协商 `msg-op-v1`，任一缺席该段照旧由服务端
+渲染）：
+
+- `telegram-final-ops-v1`：普通成功轮次的终稿经 `purpose: 'turn-final'`（`send` 带
+  `finalPart`，附件走 `media`）发布；`TurnEndPayload.clientFinal?: { complete }`
+  告诉服务端是否全部确认。complete 时服务端不再渲染、提升续跑锚点并做收口副作用；否则
+  删掉已落地的客户端终稿段并照旧自己发布。桌面端发布前先把不带 `clientFinal` 的
+  `turn.end` 写进持久出箱，崩溃重放走「交回服务端」那一版，终稿必达不降级。
+- `telegram-card-ops-v1`：执行中交互卡经 `purpose: 'interaction-card'`（带
+  `interactionId`；收口 `edit` 带 `interactionClosed` 并清空按钮）发布；按钮 token 即
+  buttonId，回调仍由服务端转成 `interaction.decision`。协商后桌面端不再为这类卡发
+  `interaction.request` / `interaction.cancel`，op 被明确拒绝时才回落旧帧。
+- `telegram-commands-v1`：新增 `provider.commands.set` 帧（默认菜单有且仅有一份，
+  command / description 遵守 Telegram 限制），服务端持久化并执行 `setMyCommands`。
+
+新增拒绝码 `TURN_UNAVAILABLE`（终稿 / 卡片 op 时这一轮已收口或不属于该设备）。`msg.op`
+各 purpose 允许的动作与附属字段由 parse 强制联动，放错位置一律拒收。
 
 ### X 回复链的结构化输入
 

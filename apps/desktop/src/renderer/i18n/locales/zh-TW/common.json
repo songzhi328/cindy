@@ -3226,7 +3226,13 @@
         "permission": "檢視或切換權限模式",
         "settings": "檢視目前專案與 Agent 設定",
         "ctr": "接管桌面端的任務",
-        "exctr": "退出遠端控制"
+        "exctr": "退出遠端控制",
+        "workspace": "切換專案工作區",
+        "unbind": "清除目前專案對應",
+        "effort": "選擇推理強度",
+        "agent": "選擇 Agent",
+        "status": "檢視關聯狀態",
+        "unlink": "解除 Telegram 關聯"
       },
       "behavior": {
         "title": "回應與引用",

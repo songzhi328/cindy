@@ -248,6 +248,7 @@ export const HOOK_MESSAGE_TYPES = [
   'provider.behavior.get',
   'provider.behavior.set',
   'provider.behavior.state',
+  'provider.commands.set',
 ] as const;
 
 export type HookMessageType = (typeof HOOK_MESSAGE_TYPES)[number];
@@ -516,6 +517,11 @@ export interface TurnEndPayload {
    * 旧 server 收到未知字段静默忽略(校验器只查已知字段), 向后兼容。
    */
   attachments?: TaskAttachment[];
+  /**
+   * 客户端终稿发布结果(HOOK_FEATURE_TELEGRAM_FINAL_OPS)。缺席 = 客户端没发布过终稿,
+   * 服务端照旧渲染。complete=true 时本帧可省略 attachments(已由 msg.op media 发布)。
+   */
+  clientFinal?: TurnEndClientFinal;
 }
 
 /**
@@ -1393,12 +1399,18 @@ export type MessageOpAction =
       silent?: boolean;
       /** 该消息挂的按钮(语义与形态都由客户端定, 服务端原样下发)。 */
       buttons?: MessageOpButton[][];
+      /**
+       * 渠道消息特效(Telegram `message_effect_id`), 客户端决定挂不挂、挂哪个;
+       * 服务端原样透传。缺席 = 不挂。
+       */
+      effectId?: string;
     }
   | {
       kind: 'edit';
       messageId: string;
       text: string;
       tier?: 'rich' | 'html' | 'plain';
+      /** 缺席 = 保留原键盘; 空数组 = 清空键盘(收口的卡片必须显式清)。 */
       buttons?: MessageOpButton[][];
     }
   | { kind: 'delete'; messageId: string }
@@ -1419,7 +1431,11 @@ export type MessageOpAction =
     };
 
 export interface MessageOpButton {
-  /** 客户端生成的回调 token; 服务端只做透传与一次性消费, 不解释语义。 */
+  /**
+   * 客户端生成的回调 token; 服务端只做透传与一次性消费, 不解释语义。
+   * `purpose: 'interaction-card'` 时它就是 interaction 的 buttonId: 服务端自己铸
+   * callback_data 并记映射, 用户点按后照旧回 interaction.decision(buttonId=token)。
+   */
   token: string;
   label: string;
 }
@@ -1451,9 +1467,22 @@ export interface MessageOpPayload {
   action: MessageOpAction;
   /**
    * 这次操作在 turn 里承担什么角色(可选; 缺席 = 普通独立操作, 与本字段出现前
-   * 的语义逐字相同)。目前只有 `'turn-progress'`, 见 MessageOpPurpose。
+   * 的语义逐字相同)。见 MessageOpPurpose。
    */
   purpose?: MessageOpPurpose;
+  /**
+   * `purpose: 'turn-final'` 时必填(parse 强制): 这条是终稿的第几段(0 起)。
+   * 0 是答案主体: 服务端按这一轮的回复引用策略挂触发消息(与服务端自己发终稿首段
+   * 同一规则), 且它是续跑锚点的候选。其余 purpose 不得携带。
+   */
+  finalPart?: number;
+  /** `purpose: 'interaction-card'` 时必填(parse 强制): 这张卡对应的 interactionId。 */
+  interactionId?: string;
+  /**
+   * 只用于 `purpose: 'interaction-card'` 的 `edit`: 这是收口编辑(卡片已决 / 超时 /
+   * 撤销)。服务端执行编辑后作废这张卡全部回调映射, 迟到的点按不再转成 decision。
+   */
+  interactionClosed?: boolean;
 }
 
 /**
@@ -1476,11 +1505,39 @@ export interface MessageOpPayload {
  *     `ok=false, errorCode=MESSAGE_OP_ERROR_PROGRESS_UNAVAILABLE`; 客户端据此
  *     停止本轮进度操作。
  *
+ * `'turn-progress'` 也可用于 `delete`: 终稿落地后客户端尽力删掉本轮进度消息
+ * (messageId 必须是这一轮登记过的进度消息; 服务端在 turn.end 收口时照旧兜底清理)。
+ *
+ * `'turn-final'`: 客户端发布 `requestId` 那一轮**成功**的终稿(HOOK_FEATURE_TELEGRAM_FINAL_OPS)。
+ * 只用于 `send`(tier rich / html / plain)与 `media`, 必须带 `finalPart`。服务端:
+ *   - 核验这一轮仍在运行、属于该设备; turn.end 已到或不归该设备时回
+ *     MESSAGE_OP_ERROR_TURN_UNAVAILABLE;
+ *   - 投递位置照旧由服务端决定(topic 取 lane; finalPart=0 按服务端终稿首段同一回复
+ *     引用规则; 其余段不引用), 消息**会推送**(不带 disable_notification, 除非 silent);
+ *   - 每条消息登记 botAuthored route(requestId 同一轮, 非 terminal), 并记为「客户端
+ *     终稿段」—— 续跑锚点(terminal route)要等 turn.end 的 `clientFinal.complete`
+ *     确认后才由服务端把 finalPart=0 那条提升上去(见 TurnEndPayload.clientFinal)。
+ *
+ * `'interaction-card'`: 客户端发布执行中交互卡(HOOK_FEATURE_TELEGRAM_CARD_OPS)。
+ * 只用于 `send` / `edit`, 必须带 `interactionId`。正文与按钮布局全由客户端渲染;
+ * 服务端:
+ *   - 核验 requestId 是该设备仍在运行的一轮;
+ *   - 投递位置沿用服务端现行规则: 私聊发到本 lane(按回复引用策略挂触发消息), 群 /
+ *     topic 改投 owner 私聊并在正文前加服务端本地化的来源说明与原消息链接(HTML
+ *     转义后前置; 这是投递面的注记, 不属于卡片内容);
+ *   - 按钮: 每个 MessageOpButton.token 是 buttonId, 服务端铸 callback_data、记
+ *     (requestId, interactionId, buttonId) 映射, 点按后照旧回 interaction.decision、
+ *     清键盘、answerCallbackQuery; 回调映射的有效期与现行卡片相同;
+ *   - `edit` 的 messageId 按 interactionId 记录核验(卡片可能已被改投 owner 私聊,
+ *     不在本 lane 的 route 里); `interactionClosed: true` 时执行后作废回调映射;
+ *   - 协商后客户端不再为这类卡发 interaction.request / interaction.cancel; 本轮
+ *     turn.end 收口时服务端对仍未收口的客户端卡只作废回调、清键盘, 不改写正文。
+ *
  * 幂等: 服务端按 opId + 内容指纹去重, **同一 opId 配不同内容**回
  * `MESSAGE_OP_ERROR_IDEMPOTENCY_CONFLICT`。所以回执未知时客户端必须原样重发
  * (同 opId 同正文), 不得沿用 opId 换正文。
  */
-export type MessageOpPurpose = 'turn-progress';
+export type MessageOpPurpose = 'turn-progress' | 'turn-final' | 'interaction-card';
 
 /*
  * msg.op.result.errorCode: 服务端**自己**判定的拒绝(未调用 Bot API, 或调用结果
@@ -1508,6 +1565,12 @@ export const MESSAGE_OP_ERROR_CAPACITY_REACHED = 'CAPACITY_REACHED';
 export const MESSAGE_OP_ERROR_OUTCOME_UNKNOWN = 'OUTCOME_UNKNOWN';
 /** 渠道已执行但服务端登记失败(服务端已尽力撤回该消息)。明确失败, 可换 opId 重试。 */
 export const MESSAGE_OP_ERROR_PERSIST_FAILED = 'PERSIST_FAILED';
+/**
+ * `turn-final` / `interaction-card`: 这一轮已收口(turn.end 已到)、不认识或不属于
+ * 该设备。客户端停止本轮这类 op —— 终稿交回服务端按 turn.end 发布, 卡片交回
+ * interaction.request 旧路径(本轮仍在跑时)。
+ */
+export const MESSAGE_OP_ERROR_TURN_UNAVAILABLE = 'TURN_UNAVAILABLE';
 
 /**
  * 双向能力标识: 官方 Telegram 的运行中进度消息改由 desktop 渲染、经
@@ -1515,10 +1578,11 @@ export const MESSAGE_OP_ERROR_PERSIST_FAILED = 'PERSIST_FAILED';
  * 同时协商; 只在 telegram provider 的连接上声明。
  *
  * 协商后的分工(内容面在客户端, 投递面在服务端):
- *   - desktop 用与个人 bot 同一份渲染(@cindy/im `renderTelegramProgressFrame`)
- *     生成 HTML, 首帧 `send`、后续 `edit`; HTML 被拒(`channelErrorCode=400`)
- *     本地回落 `tier: 'plain'`, `message is not modified` 视为成功, 429 按
- *     `retryAfterMs` 节流并合并到最新帧;
+ *   - desktop 用与个人 bot 同一个过程载体与渲染(@cindy/im
+ *     `startTelegramProgressCarrier` + `markdownToTelegramHtml`)生成 HTML, 首帧
+ *     `send`、后续 `edit`; HTML 被拒(`channelErrorCode=400`)本地回落
+ *     `tier: 'plain'`, `message is not modified` 视为成功, 429 按 `retryAfterMs`
+ *     退避, 期间的新帧合并成最新一帧;
  *   - desktop **照发** turn.progress(服务端靠它续 turn lease), 但服务端**不再
  *     用它渲染**进度消息 —— 唯一例外是服务端仍自己承载进度的私聊草稿模式
  *     (此时进度 msg.op 回 PROGRESS_UNAVAILABLE, 服务端继续按 turn.progress 出草稿);
@@ -1528,6 +1592,73 @@ export const MESSAGE_OP_ERROR_PERSIST_FAILED = 'PERSIST_FAILED';
  * 逐字相同。
  */
 export const HOOK_FEATURE_TELEGRAM_PROGRESS_OPS = 'telegram-progress-ops-v1';
+
+/**
+ * 双向能力标识: 官方 Telegram **成功轮次**的终稿由 desktop 用与个人 bot 同一套收口
+ * (@cindy/im `startTelegramStreaming` 的 finalize: Rich → HTML → 纯文本、分块、落地后
+ * 删进度消息)经 `msg.op`(`purpose: 'turn-final'`)发布; 附件经 `media` 发布。须与
+ * HOOK_FEATURE_MESSAGE_OPS 同时协商, 只在 telegram 连接上声明。
+ *
+ * **终稿必达不降级**: desktop 先把 turn.end 写进本地持久出箱, 再发布, 最后发 turn.end
+ * 并用 `clientFinal` 说明结果。服务端只在 `clientFinal.complete === true` 时跳过自己
+ * 渲染; 否则(未完成 / 缺席 / 重启后从出箱重放)删掉本轮已落地的客户端终稿段并照旧自己
+ * 发布 —— 最坏是一次重新发布, 不会缺答案也不会两份并存。
+ *
+ * 只覆盖普通轮次的 `status: 'ok'`。失败 / 取消 / 续跑轮(原位修正旧终稿)/ 正文恰为
+ * NO_REPLY(ambient 判定在服务端)/ 附件超出服务端单轮上限时, desktop 不发 `turn-final`,
+ * 由服务端按 turn.end 照旧处理。
+ */
+export const HOOK_FEATURE_TELEGRAM_FINAL_OPS = 'telegram-final-ops-v1';
+
+/**
+ * 双向能力标识: 官方 Telegram 执行中交互卡(ask / plan / 权限)由 desktop 用与个人 bot
+ * 同一份卡片渲染(@cindy/im `layoutTelegramCard`: 标题 + markdown 正文 → HTML、正文上限、
+ * 按钮成对排布)经 `msg.op`(`purpose: 'interaction-card'`)发布与收口; 按钮回调仍由
+ * 服务端收入站并照旧回 interaction.decision。须与 HOOK_FEATURE_MESSAGE_OPS 同时协商。
+ * 任一侧缺席: 走 interaction.request / interaction.cancel 旧路径, 服务端照旧渲染。
+ */
+export const HOOK_FEATURE_TELEGRAM_CARD_OPS = 'telegram-card-ops-v1';
+
+/**
+ * 双向能力标识: 官方 Telegram 的命令菜单以 desktop 的命令注册表为唯一真相源, 经
+ * `provider.commands.set` 下发。任一侧缺席: 服务端照旧用自己的 TELEGRAM_COMMANDS。
+ */
+export const HOOK_FEATURE_TELEGRAM_COMMANDS = 'telegram-commands-v1';
+
+/**
+ * turn.end 的客户端终稿发布结果(只在协商 HOOK_FEATURE_TELEGRAM_FINAL_OPS、且 desktop
+ * 尝试过 `turn-final` 时出现)。
+ */
+export interface TurnEndClientFinal {
+  /**
+   * true = 本轮全部终稿段与附件都拿到了成功回执: 服务端不再渲染 finalText / attachments,
+   * 把 finalPart=0 那条提升为续跑锚点(terminal route), 照常做收口副作用(群中继
+   * —— 文本取本帧 finalText、消息 id 取锚点; 清理进度消息与未收口卡片; 终态表情;
+   * inflight 移除)。
+   * false = 发布没有完整确认: 服务端删掉本轮已登记的客户端终稿段(尽力), 再照旧自己发布。
+   */
+  complete: boolean;
+}
+
+/**
+ * provider.commands.set(desktop -> server): 官方 Telegram 命令菜单
+ * (HOOK_FEATURE_TELEGRAM_COMMANDS)。每次握手成功后发一次; 服务端把它持久化为该设备
+ * 绑定 principal 的菜单, 立即并在之后每次需要重设菜单时(启动 / 重新绑定)按
+ * `{type:'chat', chat_id: principalId}` 作用域调用 setMyCommands。服务端只校验形状
+ * 与 Telegram 限制, 不改文案、不增删命令。
+ */
+export interface ProviderCommandsSetPayload {
+  provider: 'telegram';
+  /** 每个语言一份; languageCode=null 是不带 language_code 的默认菜单(必须有且仅有一份)。 */
+  menus: TelegramCommandMenu[];
+}
+
+export interface TelegramCommandMenu {
+  /** Telegram language_code(两位小写 ISO 639-1); null = 默认菜单。 */
+  languageCode: string | null;
+  /** 菜单顺序即展示顺序。command 1-32 位 [a-z0-9_]; description 1-256 字。至多 100 条。 */
+  commands: Array<{ command: string; description: string }>;
+}
 
 /**
  * msg.op.result(server -> desktop): 一次消息操作的回执。
@@ -1777,6 +1908,10 @@ export type HookProviderBehaviorSetMessage = HookEnvelope<
   'provider.behavior.set',
   ProviderBehaviorSetPayload
 >;
+export type HookProviderCommandsSetMessage = HookEnvelope<
+  'provider.commands.set',
+  ProviderCommandsSetPayload
+>;
 export type HookProviderBehaviorStateMessage = HookEnvelope<
   'provider.behavior.state',
   ProviderBehaviorStatePayload
@@ -1823,6 +1958,7 @@ export type HookMessage =
   | HookProviderBehaviorGetMessage
   | HookProviderBehaviorSetMessage
   | HookProviderBehaviorStateMessage
+  | HookProviderCommandsSetMessage
   | HookMessageOpMessage
   | HookMessageOpResultMessage;
 

@@ -47,6 +47,9 @@ import {
   makeTurnEnd,
   makeTurnProgress,
   makeTurnReopen,
+  HOOK_FEATURE_TELEGRAM_CARD_OPS,
+  HOOK_FEATURE_TELEGRAM_COMMANDS,
+  HOOK_FEATURE_TELEGRAM_FINAL_OPS,
   HOOK_FEATURE_TELEGRAM_PROGRESS_OPS,
   HOOK_FEATURE_TURN_DELIVERY,
   HOOK_FEATURE_TURN_REOPEN,
@@ -61,7 +64,10 @@ import {
   type TaskSource,
   type QueryRequestPayload,
   type TurnDeliveryPayload,
+  type TurnEndClientFinal,
   type TurnEndPayload,
+  type TelegramCommandMenu,
+  makeProviderCommandsSet,
 } from '@cindy/slack-hook-protocol';
 import { createTelegramMessageLifecycle, type TelegramMessageLifecycle } from '@cindy/im';
 
@@ -71,12 +77,18 @@ import type { GroupHistoryAccessScope } from '../im/shared/groupHistoryAccess.js
 import { groupHistoryAccessForExternalKey } from './groupHistoryScope.js';
 import { isPathWithin } from './paths.js';
 import { createAckReactions, type AckReactionTask } from './ackReactions.js';
+import { createMsgOpResultRouter, isTelegramTurnOpId } from './telegramMsgOp.js';
 import {
-  createMsgOpResultRouter,
-  createOfficialTelegramProgressCarrier,
-  isTelegramProgressOpId,
-  type OfficialTelegramProgressCarrier,
-} from './telegramProgressCarrier.js';
+  createOfficialTelegramTurnCarrier,
+  isClientFinalEligible,
+  type ClientFinalInput,
+  type OfficialTelegramTurnCarrier,
+} from './telegramTurnCarrier.js';
+import {
+  createOfficialTelegramCardPublisher,
+  type OfficialTelegramCardPublisher,
+  type OfficialTelegramCardPublisherDeps,
+} from './telegramCardOps.js';
 import type { HookConnectionConfig } from './store.js';
 import type { HookBindingStore } from './bindings.js';
 import { terminalDeliveryExpired } from './requestLedger.js';
@@ -353,6 +365,11 @@ export interface HookDispatcherDeps {
    * eager behavior unless they opt out explicitly.
    */
   accountInitiallyActive?: boolean;
+  /**
+   * 官方 Telegram 命令菜单(telegram-commands-v1): 以 desktop 命令注册表为准, 每次握手
+   * 宣告该能力后经 provider.commands.set 下发。省略 = 不下发(服务端照旧用自己的)。
+   */
+  telegramCommandMenus?: () => TelegramCommandMenu[];
   log: { info(msg: string): void; warn(msg: string): void };
 }
 
@@ -669,6 +686,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     subscribeUiTurnDispatching,
     subscribeUiTurnUndispatched,
     accountInitiallyActive,
+    telegramCommandMenus,
     log,
   } = deps;
 
@@ -835,72 +853,162 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     emojiReactions: () => emojiReactionsMode,
     log,
   });
-  /** 进度 msg.op 的请求/回执配对(所有轮次共用; 回执按 opId 路由)。 */
-  const progressOpRouter = createMsgOpResultRouter();
-  /** 仍在驱动进度消息的轮次(账号切换 / dispose 时统一停下)。 */
-  const activeProgressCarriers = new Set<OfficialTelegramProgressCarrier>();
-  const closeProgressCarriers = (): void => {
-    for (const carrier of [...activeProgressCarriers]) carrier.close();
-    activeProgressCarriers.clear();
-    progressOpRouter.failAll();
+  /** 本端驱动的 Telegram msg.op(进度 / 终稿 / 卡片)的请求/回执配对(所有轮次共用)。 */
+  const telegramOpRouter = createMsgOpResultRouter();
+  /** 仍在驱动消息的轮次载体与卡片发布器(账号切换 / dispose 时统一停下)。 */
+  const activeTurnCarriers = new Set<OfficialTelegramTurnCarrier>();
+  const activeCardPublishers = new Set<OfficialTelegramCardPublisher>();
+  const closeTelegramTurnOps = (): void => {
+    for (const carrier of [...activeTurnCarriers]) carrier.close();
+    activeTurnCarriers.clear();
+    for (const publisher of [...activeCardPublishers]) publisher.dispose();
+    activeCardPublishers.clear();
+    telegramOpRouter.failAll();
+  };
+  /** 该连接最近一次 welcome 是否同时宣告了 msg-op-v1 与 feature; 能力快照缺席(离线)= undefined。 */
+  const telegramOpsNegotiated = (connectionId: string, feature: string): boolean | undefined => {
+    const features = serverFeatures.get(connectionId);
+    if (features === undefined) return undefined;
+    return features.includes(HOOK_FEATURE_MESSAGE_OPS) && features.includes(feature);
   };
 
   /**
-   * 一轮官方 Telegram 的进度消息出口(只在 telegram 任务上建)。
+   * 一轮官方 Telegram 的消息载体(只在 telegram 任务上建): 进度消息与成功终稿。
    *
-   * 双方都宣告 msg-op-v1 + telegram-progress-ops-v1 时, 首帧起由本端渲染并经
-   * msg.op 驱动(个人 bot 同一生命周期, 见 telegramProgressCarrier.ts); 否则什么都
-   * 不做, 服务端照旧渲染 turn.progress。turn.progress 由调用方**照发**(lease)。
+   * 进度: 双方都宣告 telegram-progress-ops-v1 时, 首帧起由本端渲染并经 msg.op 驱动
+   * (个人 bot 同一个 handle, 见 telegramTurnCarrier.ts); 否则什么都不做, 服务端照旧
+   * 渲染 turn.progress。turn.progress 由调用方**照发**(lease)。协商按帧现查: 断线期间
+   * 能力快照缺席只跳过这一帧; 新 welcome 明确不再宣告(滚动发布落到旧节点)时本轮停止 ——
+   * 旧节点会自己渲染 turn.progress。
    *
-   * 协商按帧现查: 断线期间能力快照缺席只跳过这一帧; 新 welcome 明确不再宣告
-   * (滚动发布落到旧节点)时本轮停止 msg.op —— 旧节点会自己渲染 turn.progress。
+   * 终稿: 宣告 telegram-final-ops-v1 且这一轮可由本端发布(isClientFinalEligible)时,
+   * 用同一个 handle 的 finalize 发布, 返回 turn.end 要带的 clientFinal; 否则冲刷最后
+   * 一帧进度后停下, 返回 null(服务端照旧发布)。
    */
-  function turnProgressCarrier(
+  function telegramTurnCarrier(
     connectionId: string,
     requestId: string,
     externalKey: string,
-  ): OfficialTelegramProgressCarrier {
-    let carrier: OfficialTelegramProgressCarrier | null = null;
+  ): {
+    update(markdown: string): void;
+    /** 不由本端发布终稿时的收口: 冲刷最后一帧进度后停下(wire 上先于 turn.end)。 */
+    finish(): void;
+    /**
+     * 由本端发布成功终稿; 不发布(未协商 / 不适用)时等同 finish() 并返回 null。
+     * `beforePublish` 在真正发出第一条终稿 op 之前同步调用(调用方在此把 turn.end
+     * 写进持久出箱, 保证发布中途崩溃时服务端仍能按出箱重放兜底)。
+     */
+    publishFinal(
+      input: ClientFinalInput,
+      beforePublish?: () => void,
+    ): Promise<TurnEndClientFinal | null>;
+    close(): void;
+  } {
+    let carrier: OfficialTelegramTurnCarrier | null = null;
+    let progressLost = false;
     let stopped = false;
+    const ensureCarrier = (): OfficialTelegramTurnCarrier => {
+      if (!carrier) {
+        carrier = createOfficialTelegramTurnCarrier({
+          connectionId,
+          requestId,
+          externalKey,
+          directMessage: deriveLaneKind(externalKey) === 'dm',
+          getSend: () => sendFns.get(connectionId),
+          router: telegramOpRouter,
+          log,
+        });
+        activeTurnCarriers.add(carrier);
+      }
+      return carrier;
+    };
     const stop = (): void => {
       stopped = true;
-      if (carrier) activeProgressCarriers.delete(carrier);
+      if (carrier) activeTurnCarriers.delete(carrier);
     };
     return {
       update(markdown) {
-        if (stopped) return;
-        const features = serverFeatures.get(connectionId);
-        if (features === undefined) return;
-        if (
-          !features.includes(HOOK_FEATURE_MESSAGE_OPS) ||
-          !features.includes(HOOK_FEATURE_TELEGRAM_PROGRESS_OPS)
-        ) {
-          if (carrier) {
-            carrier.close();
-            stop();
-          }
+        if (stopped || progressLost) return;
+        const negotiated = telegramOpsNegotiated(connectionId, HOOK_FEATURE_TELEGRAM_PROGRESS_OPS);
+        if (negotiated === undefined) return;
+        if (!negotiated) {
+          // 已经由本端建过进度消息: 新节点不认这份能力, 本轮进度到此为止(旧节点自己渲染)。
+          if (carrier) progressLost = true;
           return;
         }
-        if (!carrier) {
-          carrier = createOfficialTelegramProgressCarrier({
-            connectionId,
-            requestId,
-            externalKey,
-            getSend: () => sendFns.get(connectionId),
-            router: progressOpRouter,
-            log,
-          });
-          activeProgressCarriers.add(carrier);
-        }
-        carrier.update(markdown);
+        ensureCarrier().update(markdown);
       },
       finish() {
         carrier?.finish();
         stop();
       },
+      async publishFinal(input, beforePublish) {
+        if (stopped) return null;
+        const negotiated =
+          telegramOpsNegotiated(connectionId, HOOK_FEATURE_TELEGRAM_FINAL_OPS) === true;
+        if (!negotiated || !isClientFinalEligible(input)) {
+          carrier?.finish();
+          stop();
+          return null;
+        }
+        const target = ensureCarrier();
+        beforePublish?.();
+        try {
+          return { complete: await target.publishFinal(input) };
+        } finally {
+          stop();
+        }
+      },
       close() {
         carrier?.close();
         stop();
+      },
+    };
+  }
+
+  /**
+   * 一轮官方 Telegram 的交互卡出口: 双方宣告 telegram-card-ops-v1 时由本端渲染并经
+   * msg.op 发布(见 telegramCardOps.ts), 否则走 interaction.request / cancel 旧路径。
+   * 每张卡在打开那一刻定路径, 收口跟着它走, 两条路径不混用。
+   */
+  function telegramCardPublisher(
+    connectionId: string,
+    requestId: string,
+    externalKey: string,
+    legacy: OfficialTelegramCardPublisherDeps['legacy'],
+  ): OfficialTelegramCardPublisherDeps['legacy'] & { drain(): Promise<void> } {
+    let publisher: OfficialTelegramCardPublisher | null = null;
+    const clientCards = new Set<string>();
+    return {
+      open(card) {
+        if (telegramOpsNegotiated(connectionId, HOOK_FEATURE_TELEGRAM_CARD_OPS) !== true) {
+          legacy.open(card);
+          return;
+        }
+        if (!publisher) {
+          publisher = createOfficialTelegramCardPublisher({
+            connectionId,
+            requestId,
+            externalKey,
+            getSend: () => sendFns.get(connectionId),
+            router: telegramOpRouter,
+            legacy,
+            log,
+          });
+          activeCardPublishers.add(publisher);
+        }
+        clientCards.add(card.interactionId);
+        publisher.open(card);
+      },
+      close(interactionId, reason) {
+        if (publisher && clientCards.delete(interactionId)) {
+          publisher.close(interactionId, reason);
+          return;
+        }
+        legacy.close(interactionId, reason);
+      },
+      async drain() {
+        await publisher?.drain();
       },
     };
   }
@@ -1372,8 +1480,8 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     );
     // 续跑轮同样由本端驱动进度消息(新建一条, 不改写被续的旧终稿 —— 那条由服务端
     // 在终稿时原位修正, 本轮进度消息随后由服务端清理)。
-    const progressCarrier = messageLifecycle
-      ? turnProgressCarrier(entry.connectionId, requestId, entry.externalKey)
+    const turnCarrier = messageLifecycle
+      ? telegramTurnCarrier(entry.connectionId, requestId, entry.externalKey)
       : null;
     let claimed = false;
     // runner 可能在 watch() 里**同步**收口(会话已不在进程里就直接 onAbandon),
@@ -1416,7 +1524,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     const cleanup = (): void => {
       runningByRequest.delete(requestKey);
       cancelRequested.delete(requestKey);
-      progressCarrier?.close();
+      turnCarrier?.close();
       detach();
     };
     const cancelWatch = watch({
@@ -1463,7 +1571,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
         if (messageLifecycle && !messageLifecycle.acceptProgress()) return;
         const send = sendFns.get(entry.connectionId);
         if (send) send(makeTurnProgress({ requestId, text }));
-        progressCarrier?.update(text);
+        turnCarrier?.update(text);
       },
       // 停止观察即摘账 —— 成功收口还要异步收集附件, 那段时间它不该再被算作"在观察的
       // 那一轮"(否则排在后面的桌面消息一 dispatch 就被误判成顶替)。发帧的闭包照旧存活。
@@ -1472,7 +1580,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
         const wasCancelled = cancelRequested.has(requestKey);
         // 终稿栅栏前冲刷最新进度帧(wire 上排在 turn.end 之前); 撤销 / 换账号则不冲刷。
         if (!revoked && claimed && isCurrentGeneration(entry.accountGeneration)) {
-          progressCarrier?.finish();
+          turnCarrier?.finish();
         }
         cleanup();
         if (revoked || !claimed || !isCurrentGeneration(entry.accountGeneration)) return;
@@ -1561,7 +1669,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
           // revoked 是"连迟到的帧都别发"的开关 —— 只有连接已断时才该置位。
           if (silent) {
             revoked = true;
-            progressCarrier?.close();
+            turnCarrier?.close();
           }
           if (noRemember) denyRemember = true;
           cancelWatch();
@@ -1592,22 +1700,39 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       task.requestId,
       task.run.source,
     );
-    const progressCarrier = messageLifecycle
-      ? turnProgressCarrier(task.connectionId, task.requestId, task.externalKey)
+    const turnCarrier = messageLifecycle
+      ? telegramTurnCarrier(task.connectionId, task.requestId, task.externalKey)
       : null;
 
     // 进度快照直发不缓存: 断线期间的中间帧没有补发价值(turn.end 会带最终
     // 结果), 发送失败静默丢弃即可。协商了客户端进度时 turn.progress 仍照发
-    // (服务端靠它续 lease), 进度消息本身由 progressCarrier 经 msg.op 驱动。
+    // (服务端靠它续 lease), 进度消息本身由 turnCarrier 经 msg.op 驱动。
     const onProgress = (text: string): void => {
       if (!isCurrentGeneration(task.accountGeneration)) return;
       if (messageLifecycle && !messageLifecycle.acceptProgress()) return;
       const send = sendFns.get(task.connectionId);
       if (send) send(makeTurnProgress({ requestId: task.requestId, text }));
-      progressCarrier?.update(text);
+      turnCarrier?.update(text);
     };
     // 交互卡同样直发不缓存: 连接不在线时用户本来就看不到卡, runner 侧的
     // 交互超时会按安全默认自决, 任务不会卡死
+    const legacyCards: OfficialTelegramCardPublisherDeps['legacy'] = {
+      open(card) {
+        const send = sendFns.get(task.connectionId);
+        if (send) send(makeInteractionRequest({ requestId: task.requestId, ...card }));
+      },
+      close(interactionId, reason) {
+        const send = sendFns.get(task.connectionId);
+        if (send) {
+          send(makeInteractionCancel({ requestId: task.requestId, interactionId, reason }));
+        }
+      },
+    };
+    // 官方 Telegram 协商了 telegram-card-ops-v1 时卡片由本端渲染发布, 否则(含 Slack /
+    // X)走 interaction.request / cancel 旧路径。
+    const cards = messageLifecycle
+      ? telegramCardPublisher(task.connectionId, task.requestId, task.externalKey, legacyCards)
+      : null;
     const onInteraction = (card: {
       interactionId: string;
       kind: string;
@@ -1616,13 +1741,11 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       buttons: InteractionButton[];
     }): void => {
       if (!isCurrentGeneration(task.accountGeneration)) return;
-      const send = sendFns.get(task.connectionId);
-      if (send) send(makeInteractionRequest({ requestId: task.requestId, ...card }));
+      (cards ?? legacyCards).open(card);
     };
     const onInteractionCancel = (interactionId: string, reason: string): void => {
       if (!isCurrentGeneration(task.accountGeneration)) return;
-      const send = sendFns.get(task.connectionId);
-      if (send) send(makeInteractionCancel({ requestId: task.requestId, interactionId, reason }));
+      (cards ?? legacyCards).close(interactionId, reason);
     };
 
     let outcome: HookRunOutcome;
@@ -1713,21 +1836,18 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     runningByRequest.delete(requestKey);
     pendingGroupAdmissions.delete(requestKey);
     if (!isCurrentGeneration(task.accountGeneration)) {
-      progressCarrier?.close();
+      turnCarrier?.close();
       cancelRequested.delete(requestKey);
       running.delete(sessionId);
       return;
     }
-    // 终稿栅栏之前收起本端进度载体: 冲刷最新帧(管道空闲时在 wire 上排在 turn.end
-    // 之前, 保持 done 前 flush 的语义), 之后不再发任何进度 op。
-    progressCarrier?.finish();
     // 取消收口: 无论 abort 后 runner 以 ok 还是 error 收口, 对上游统一
     // 报 cancelled(用户按下的是"停止", 中断导致的 error 不是真错误)
     const wasCancelled = cancelRequested.delete(requestKey);
     const status: 'ok' | 'error' | 'cancelled' = wasCancelled ? 'cancelled' : outcome.status;
     // 协议约束: error 必须带非空 errorMessage, ok / cancelled 必须为 null
     const isError = status === 'error';
-    const turnEnd: TurnEndPayload = {
+    let turnEnd: TurnEndPayload = {
       requestId: task.requestId,
       externalKey: task.externalKey,
       sessionId,
@@ -1743,13 +1863,49 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     // outbox path. A late progress callback from the observer must never write
     // over the answer after this point.
     const finalIntent = messageLifecycle?.beginFinal() ?? null;
+    const terminalRecord = {
+      connectionId: task.connectionId,
+      requestId: task.requestId,
+      ack: task.ack,
+    };
+    let persistedBeforePublish = false;
+    if (turnCarrier) {
+      // 官方 Telegram: 协商了客户端终稿且这一轮适用时, 用个人 bot 同一套收口经 msg.op
+      // 发布; 否则冲刷最后一帧进度(wire 上先于 turn.end)后停下, 由服务端照旧发布。
+      // 发布前先把不带 clientFinal 的 turn.end 写进持久出箱: 中途崩溃时重启重放的是
+      // 「交回服务端」那一版, 服务端删掉已落地的客户端终稿段并自己发布, 终稿必达不降级。
+      const clientFinal = await turnCarrier.publishFinal(
+        { status, finalText: turnEnd.finalText, attachments: turnEnd.attachments },
+        () => {
+          persistedBeforePublish = persistTerminal({
+            ...terminalRecord,
+            turnEnd: durableTurnEnd(turnEnd),
+            delivery: 'pending',
+          });
+        },
+      );
+      if (clientFinal) {
+        const { attachments: _published, ...withoutAttachments } = turnEnd;
+        // 完整发布时附件已经经 media 发出, turn.end 不再携带(服务端也不会再发)。
+        turnEnd = clientFinal.complete
+          ? { ...withoutAttachments, clientFinal }
+          : { ...turnEnd, clientFinal };
+      }
+    }
+    // 收口编辑先于 turn.end 到达服务端(否则服务端的收口清扫会先把卡片当成未收口)。
+    await cards?.drain();
+    if (!isCurrentGeneration(task.accountGeneration)) {
+      // 发布期间换了账号: 与上面的早退同一语义(不再以旧账号回推), 发布前写下的出箱条目
+      // 一并作废, 免得换回该账号时被重放。
+      if (persistedBeforePublish) markTerminalSent(task.connectionId, task.requestId);
+      running.delete(sessionId);
+      return;
+    }
     // Protocol idempotency replays only the original ACK. The terminal record
     // is written as a pending outbox entry before sending; an offline frame
     // stays buffered in memory until onConnected flushes the full payload.
     sendOrBuffer(task.connectionId, makeTurnEnd(turnEnd), {
-      connectionId: task.connectionId,
-      requestId: task.requestId,
-      ack: task.ack,
+      ...terminalRecord,
       turnEnd: durableTurnEnd(turnEnd),
     });
     if (messageLifecycle && finalIntent) {
@@ -2559,7 +2715,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       accountActive = false;
       accountGeneration += 1;
       clearRecoveryDeliveries();
-      closeProgressCarriers();
+      closeTelegramTurnOps();
       if (accountDeactivation !== null) {
         await accountDeactivation;
         return;
@@ -2871,7 +3027,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     onDisconnected(connectionId) {
       sendFns.delete(connectionId);
       // 在等的进度回执不会再来: 立刻按"回执未知"收口(send 下一窗口原 opId 重发)。
-      progressOpRouter.failConnection(connectionId);
+      telegramOpRouter.failConnection(connectionId);
       for (const pending of pendingDeliveryTurnEnds.values()) {
         if (pending.connectionId !== connectionId || pending.timer === null) continue;
         clearTimeout(pending.timer);
@@ -2895,7 +3051,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     },
     dispose() {
       clearRecoveryDeliveries();
-      closeProgressCarriers();
+      closeTelegramTurnOps();
       unsubscribeUiContinuation?.();
       unsubscribeUiIntervention?.();
       unsubscribeUiTurnDispatching?.();
@@ -2915,7 +3071,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     onMessageOpResult(payload: MessageOpResultPayload) {
       // 进度操作的回执(含等待方已超时让位后的迟到回执)只归进度载体, 不落到
       // 表情的失败日志里。
-      if (progressOpRouter.settle(payload) || isTelegramProgressOpId(payload.opId)) return;
+      if (telegramOpRouter.settle(payload) || isTelegramTurnOpId(payload.opId)) return;
       recoveryDeliveries.get(payload.opId)?.(payload.ok);
       // 带上按连接取发送函数的钩子: 群限制了可用表情时要用基础款回落一次,
       // 而该发到哪条连接由 ackReactions 自己记的 task 决定。
@@ -2933,6 +3089,17 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       // 老实例不宣告 turn.reopen 时必须立刻停用回流, 不能拿上一次的快照发帧。
       serverFeatures.set(connectionId, features ? [...features] : []);
       sendFns.set(connectionId, send);
+      // 官方 Telegram 命令菜单以本端注册表为准: 每次握手都重发一次(服务端持久化并在
+      // 启动 / 重新绑定时复用), 文案跟着桌面端版本走。
+      if (telegramCommandMenus && features?.includes(HOOK_FEATURE_TELEGRAM_COMMANDS)) {
+        try {
+          send(makeProviderCommandsSet({ provider: 'telegram', menus: telegramCommandMenus() }));
+        } catch (err) {
+          log.warn(
+            `telegram command menu not sent: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
       // 断线时没送出去的终态表情在这里补 —— 否则那条消息永远挂着 👀。
       // opId 由 requestId 派生, 服务端按它去重, 补发不会打出第二个。
       ackReactions.onReconnected(connectionId, send);

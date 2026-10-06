@@ -3226,7 +3226,13 @@
         "permission": "権限モードを表示・切り替え",
         "settings": "プロジェクトと Agent 設定を表示",
         "ctr": "デスクトップセッションをリモート操作",
-        "exctr": "リモート操作を終了"
+        "exctr": "リモート操作を終了",
+        "workspace": "プロジェクトワークスペースを切り替え",
+        "unbind": "現在のプロジェクト設定を解除",
+        "effort": "推論強度を選択",
+        "agent": "Agent を選択",
+        "status": "連携状態を表示",
+        "unlink": "Telegram 連携を解除"
       },
       "behavior": {
         "title": "リアクションと引用",

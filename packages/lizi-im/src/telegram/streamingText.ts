@@ -144,6 +144,13 @@ export interface TelegramStreamingDeps extends TelegramProgressDeps {
    * 回落 HTML/Markdown 新发。网络/权限失败必须抛出，不能伪装成可安全降级。
    */
   sendFinal?: (markdown: string, reuseReplyTarget: boolean) => Promise<string | null>;
+  /**
+   * 终稿 HTML/Markdown 分段的专用发送(第 `part` 段, 0 起)。提供时 finalize 的首段与
+   * 后续分段都走它, 不再走 `send` / `repost` —— 给需要区分"过程帧 send"与"终稿段
+   * send"的传输用(官方 bot: msg.op 的 turn-progress 与 turn-final 是两种登记)。
+   * 个人 bot 不提供, 行为不变。
+   */
+  sendFinalChunk?: (markdown: string, part: number) => Promise<string>;
   /** NO_REPLY 静默时删除流式占位消息。 */
   deleteMessage?: (messageId: string) => Promise<void>;
 }
@@ -180,6 +187,28 @@ export function startTelegramProgressCarrier(deps: TelegramProgressDeps): Telegr
     replace: (fullText) => handle.replace(fullText),
     flush: () => handle.flush(),
     close: () => handle.close(),
+  };
+}
+
+/**
+ * 过程载体 + 本端终稿收口: 同一个 handle(同一份惰性占位 / 节流 / finalize), 但不暴露
+ * 个人 bot 的 append / 图片旁路 —— 官方 bot 在协商了客户端终稿时用它。
+ */
+export interface TelegramTurnCarrier extends TelegramProgressCarrier {
+  /** 与个人 bot 完全相同的终稿收口(Rich → HTML → 纯文本、分段、落地后删过程载体)。 */
+  finalize(finalText: string): Promise<void>;
+}
+
+export function startTelegramTurnCarrier(deps: TelegramStreamingDeps): TelegramTurnCarrier {
+  const handle = TelegramStreamingTextHandle.createWithDeps(deps);
+  return {
+    get messageId() {
+      return handle.messageId;
+    },
+    replace: (fullText) => handle.replace(fullText),
+    flush: () => handle.flush(),
+    close: () => handle.close(),
+    finalize: (finalText) => handle.finalize(finalText),
   };
 }
 
@@ -263,16 +292,18 @@ class TelegramStreamingTextHandle implements StreamingTextHandle {
 
   /** 见 startTelegramProgressCarrier: 同一实现, 终稿依赖占位为接线错误。 */
   static createProgressOnly(deps: TelegramProgressDeps): TelegramStreamingTextHandle {
-    return new TelegramStreamingTextHandle(
-      {
-        send: deps.send,
-        edit: deps.edit,
-        chunk: finalUnsupported,
-        extractImageUrls: finalUnsupported,
-        uploadImages: finalUnsupported,
-      },
-      createTelegramMessageLifecycle(),
-    );
+    return TelegramStreamingTextHandle.createWithDeps({
+      send: deps.send,
+      edit: deps.edit,
+      chunk: finalUnsupported,
+      extractImageUrls: finalUnsupported,
+      uploadImages: finalUnsupported,
+    });
+  }
+
+  /** 同步建 handle(不带初始正文 = 惰性占位, 与 create 无 initial 时等价)。 */
+  static createWithDeps(deps: TelegramStreamingDeps): TelegramStreamingTextHandle {
+    return new TelegramStreamingTextHandle(deps, createTelegramMessageLifecycle());
   }
 
   static async create(
@@ -450,7 +481,12 @@ class TelegramStreamingTextHandle implements StreamingTextHandle {
           // Hermes-style close: always mint a fresh final message. If a process
           // carrier already exists, repost keeps its frozen reply target; if the
           // turn was lazy and has no carrier, send consumes the normal target lease.
-          const post = staleMessageId ? (this.deps.repost ?? this.deps.send) : this.deps.send;
+          const sendFinalChunk = this.deps.sendFinalChunk;
+          const post = sendFinalChunk
+            ? (markdown: string) => sendFinalChunk(markdown, 0)
+            : staleMessageId
+              ? (this.deps.repost ?? this.deps.send)
+              : this.deps.send;
           await sendFirstChunk(() => post(seed), seed, 1);
         }
       }
@@ -469,7 +505,9 @@ class TelegramStreamingTextHandle implements StreamingTextHandle {
         const chunk = chunks[index]!;
         this.deliveredChunks += 1;
         try {
-          await this.deps.send(chunk);
+          await (this.deps.sendFinalChunk
+            ? this.deps.sendFinalChunk(chunk, index)
+            : this.deps.send(chunk));
           this.unconfirmedChunks.delete(index);
         } catch (err) {
           if (isDefiniteRejection(err)) {

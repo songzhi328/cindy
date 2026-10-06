@@ -3226,7 +3226,13 @@
         "permission": "查看或切换权限模式",
         "settings": "查看当前项目与 Agent 设置",
         "ctr": "接管桌面端的任务",
-        "exctr": "退出远程控制"
+        "exctr": "退出远程控制",
+        "workspace": "切换项目工作区",
+        "unbind": "清除当前项目映射",
+        "effort": "选择推理强度",
+        "agent": "选择 Agent",
+        "status": "查看关联状态",
+        "unlink": "解除 Telegram 关联"
       },
       "behavior": {
         "title": "回应与引用",

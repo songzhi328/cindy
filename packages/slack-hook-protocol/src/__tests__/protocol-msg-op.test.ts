@@ -11,7 +11,12 @@ import { describe, it, expect } from 'vitest';
 
 import {
   HOOK_FEATURE_MESSAGE_OPS,
+  HOOK_FEATURE_TELEGRAM_CARD_OPS,
+  HOOK_FEATURE_TELEGRAM_COMMANDS,
+  HOOK_FEATURE_TELEGRAM_FINAL_OPS,
   HOOK_FEATURE_TELEGRAM_PROGRESS_OPS,
+  makeProviderCommandsSet,
+  makeTurnEnd,
   MESSAGE_OP_ERROR_OUTCOME_UNKNOWN,
   MESSAGE_OP_ERROR_PROGRESS_UNAVAILABLE,
   makeMessageOp,
@@ -158,7 +163,7 @@ describe('telegram-progress-ops-v1: 进度消息由客户端渲染、经 msg.op 
   it('purpose 缺 requestId、用在非 send/edit、或取未知值一律拒收', () => {
     const cases: Array<Record<string, unknown>> = [
       { opId: 'a', scope: SCOPE, purpose: 'turn-progress', action: { kind: 'send', text: 'x' } },
-      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'turn-progress', action: { kind: 'delete', messageId: '1' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'turn-progress', action: { kind: 'react', targetMessageId: '1', emoji: '' } },
       { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'final', action: { kind: 'send', text: 'x' } },
     ];
     for (const payload of cases) {
@@ -187,6 +192,132 @@ describe('telegram-progress-ops-v1: 进度消息由客户端渲染、经 msg.op 
         withPayload(makeMessageOpResult({ opId: 'o', ok: false }), { opId: 'o', ok: false, ...bad }),
       );
       expect(parsed.ok).toBe(false);
+    }
+  });
+});
+
+describe('telegram 终稿 / 卡片 / 命令菜单由客户端发布', () => {
+  const parseOp = (payload: Record<string, unknown>) =>
+    parseHookMessage(withPayload(op({ kind: 'typing' }), payload));
+
+  it('能力标识与服务端同名', () => {
+    expect([
+      HOOK_FEATURE_TELEGRAM_FINAL_OPS,
+      HOOK_FEATURE_TELEGRAM_CARD_OPS,
+      HOOK_FEATURE_TELEGRAM_COMMANDS,
+    ]).toEqual(['telegram-final-ops-v1', 'telegram-card-ops-v1', 'telegram-commands-v1']);
+  });
+
+  it('turn-final: send / media 带 finalPart round-trip; 缺 finalPart 或用在 edit 拒收', () => {
+    const sendFinal = roundTrip(
+      makeMessageOp({
+        opId: 'r:final:0',
+        requestId: 'r',
+        scope: SCOPE,
+        purpose: 'turn-final',
+        finalPart: 0,
+        action: { kind: 'send', text: '**答案**', tier: 'rich', effectId: '5107584321108051014' },
+      }),
+    );
+    expect(sendFinal.payload).toMatchObject({ purpose: 'turn-final', finalPart: 0 });
+    const media = roundTrip(
+      makeMessageOp({
+        opId: 'r:final:1',
+        requestId: 'r',
+        scope: SCOPE,
+        purpose: 'turn-final',
+        finalPart: 1,
+        action: { kind: 'media', album: true, items: [{ name: 'a.png', mimeType: 'image/png', dataBase64: 'AA' }] },
+      }),
+    );
+    expect(media.payload).toMatchObject({ finalPart: 1 });
+
+    for (const payload of [
+      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'turn-final', action: { kind: 'send', text: 'x' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'turn-final', finalPart: -1, action: { kind: 'send', text: 'x' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'turn-final', finalPart: 0, action: { kind: 'edit', messageId: '1', text: 'x' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, finalPart: 0, action: { kind: 'send', text: 'x' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'turn-progress', finalPart: 0, action: { kind: 'send', text: 'x' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, action: { kind: 'edit', messageId: '1', text: 'x', effectId: 'e' } },
+    ]) {
+      expect(parseOp(payload).ok).toBe(false);
+    }
+  });
+
+  it('interaction-card: send 带按钮、收口 edit 清键盘; 缺 interactionId 或错位字段拒收', () => {
+    const send = roundTrip(
+      makeMessageOp({
+        opId: 'r:card:i1:send',
+        requestId: 'r',
+        scope: SCOPE,
+        purpose: 'interaction-card',
+        interactionId: 'i1',
+        action: {
+          kind: 'send',
+          text: '<b>🔐 权限请求</b>',
+          tier: 'html',
+          buttons: [[{ token: 'perm:allow', label: '允许一次' }, { token: 'perm:deny', label: '拒绝' }]],
+        },
+      }),
+    );
+    expect(send.payload).toMatchObject({ interactionId: 'i1' });
+    const close = roundTrip(
+      makeMessageOp({
+        opId: 'r:card:i1:close',
+        requestId: 'r',
+        scope: SCOPE,
+        purpose: 'interaction-card',
+        interactionId: 'i1',
+        interactionClosed: true,
+        action: { kind: 'edit', messageId: '9', text: '已拒绝', tier: 'html', buttons: [] },
+      }),
+    );
+    expect(close.payload).toMatchObject({ interactionClosed: true, action: { buttons: [] } });
+
+    for (const payload of [
+      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'interaction-card', action: { kind: 'send', text: 'x' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'interaction-card', interactionId: 'i', interactionClosed: true, action: { kind: 'send', text: 'x' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, interactionId: 'i', action: { kind: 'send', text: 'x' } },
+      { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'interaction-card', interactionId: 'i', action: { kind: 'send', text: 'x', buttons: [[{ token: '', label: 'x' }]] } },
+    ]) {
+      expect(parseOp(payload).ok).toBe(false);
+    }
+  });
+
+  it('turn.end.clientFinal 可选; 形状错误拒收', () => {
+    const end = (clientFinal?: unknown) =>
+      makeTurnEnd({
+        requestId: 'r',
+        externalKey: SCOPE.externalKey,
+        sessionId: null,
+        status: 'ok',
+        finalText: 'x',
+        errorMessage: null,
+        usage: { durationMs: 1 },
+        ...(clientFinal !== undefined ? { clientFinal: clientFinal as { complete: boolean } } : {}),
+      });
+    expect(roundTrip(end({ complete: true })).payload).toMatchObject({ clientFinal: { complete: true } });
+    expect((roundTrip(end()).payload as { clientFinal?: unknown }).clientFinal).toBeUndefined();
+    expect(parseHookMessage(serializeHookMessage(end({ complete: 'yes' }))).ok).toBe(false);
+  });
+
+  it('provider.commands.set: 默认菜单必须有且唯一, 命令名与描述遵守 Telegram 限制', () => {
+    const ok = makeProviderCommandsSet({
+      provider: 'telegram',
+      menus: [
+        { languageCode: null, commands: [{ command: 'new', description: 'Create a new task' }] },
+        { languageCode: 'zh', commands: [{ command: 'new', description: '新建任务' }] },
+      ],
+    });
+    expect(roundTrip(ok).payload).toEqual(ok.payload);
+    for (const menus of [
+      [{ languageCode: 'zh', commands: [] }],
+      [{ languageCode: null, commands: [] }, { languageCode: null, commands: [] }],
+      [{ languageCode: null, commands: [{ command: 'New', description: 'x' }] }],
+      [{ languageCode: null, commands: [{ command: 'new', description: '' }] }],
+      [{ languageCode: 'zh-CN', commands: [] }, { languageCode: null, commands: [] }],
+    ]) {
+      expect(parseHookMessage(withPayload(ok, { provider: 'telegram', menus })).ok).toBe(false);
     }
   });
 });
