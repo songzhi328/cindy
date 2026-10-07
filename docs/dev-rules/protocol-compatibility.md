@@ -548,7 +548,8 @@ bot 同一份过程载体与渲染（见 `docs/product-rules/telegram-bot-parity
   buttonId，回调仍由服务端转成 `interaction.decision`。协商后桌面端不再为这类卡发
   `interaction.request` / `interaction.cancel`，op 被明确拒绝时才回落旧帧。
 - `telegram-commands-v1`：新增 `provider.commands.set` 帧（默认菜单有且仅有一份，
-  command / description 遵守 Telegram 限制），服务端持久化并执行 `setMyCommands`。
+  command / description 遵守 Telegram 限制），服务端执行 `setMyCommands`。菜单只存服务端
+  内存、不落库：desktop 每次握手重发，服务端重启后到桌面重连前用服务端默认菜单。
 
 新增拒绝码 `TURN_UNAVAILABLE`（终稿 / 卡片 op 时这一轮已收口或不属于该设备）。`msg.op`
 各 purpose 允许的动作与附属字段由 parse 强制联动，放错位置一律拒收。
