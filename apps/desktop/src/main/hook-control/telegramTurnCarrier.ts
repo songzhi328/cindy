@@ -18,9 +18,10 @@
  * 投递位置(topic、回复引用、owner 私聊改投)仍由服务端按这一轮的策略决定。
  *
  * 幂等: 过程帧首个 send 的 opId 只在拿到定案回执后换号, 回执未知时**原样**重发
- * (服务端按 opId + 内容指纹去重), 对账成功后补一次 edit 到最新帧。终稿段不在本端
- * 重试: 没有完整确认就以 `clientFinal.complete=false` 交回服务端, 服务端删掉已落地的
- * 客户端终稿段并照旧自己发布(见协议 HOOK_FEATURE_TELEGRAM_FINAL_OPS)。
+ * (服务端按 opId + 内容指纹去重), 对账成功后补一次 edit 到最新帧。终稿段回执未知时
+ * 同 opId 同正文有界重发对账(MSG_OP_UNKNOWN_REPLAYS), 仍没有完整确认就以
+ * `clientFinal.complete=false` 交回服务端, 服务端删掉已落地的客户端终稿段并照旧自己
+ * 发布(见协议 HOOK_FEATURE_TELEGRAM_FINAL_OPS)。
  */
 
 import {
@@ -44,6 +45,7 @@ import {
 import {
   abortableSleep,
   isMsgOpOutcomeUnknown,
+  MSG_OP_UNKNOWN_REPLAYS,
   isMsgOpStopCode,
   msgOpErrorFromResult,
   TELEGRAM_OP_MARKER,
@@ -223,11 +225,21 @@ export function createOfficialTelegramTurnCarrier(
     throw failed(settled);
   }
 
-  /** 终稿段: 不在本端对未知回执重试(交回服务端), 明确失败换号以便回落重发。 */
+  /**
+   * 终稿段: 回执未知时先同 opId 同正文有界重发对账(服务端有应答就回显原结果, 不会多出一份
+   * 答案), 仍未知才交回服务端; 明确失败换号以便回落重发。
+   */
   async function finalOp(part: number, action: MessageOpAction): Promise<MessageOpResultPayload> {
     const attempt = finalAttempt.get(part) ?? 0;
     const opId = `${requestId}${TELEGRAM_OP_MARKER.final}${part}:${attempt}`;
-    const result = await request(opId, 'turn-final', action, part);
+    let result = await request(opId, 'turn-final', action, part);
+    for (
+      let replay = 0;
+      isMsgOpOutcomeUnknown(result) && replay < MSG_OP_UNKNOWN_REPLAYS && isLive();
+      replay += 1
+    ) {
+      result = await request(opId, 'turn-final', action, part);
+    }
     if (isMsgOpOutcomeUnknown(result)) {
       throw new TelegramMsgOpError(`telegram msg.op ${opId} outcome unknown`);
     }

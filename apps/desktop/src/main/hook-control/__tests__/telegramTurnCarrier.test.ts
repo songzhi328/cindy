@@ -459,12 +459,31 @@ describe('官方 Telegram 终稿由客户端发布(turn-final)', () => {
     expect(finals.filter((m) => m.payload.action.kind === 'send').length).toBeGreaterThan(1);
   });
 
-  it('终稿回执未知 → 不确认(交回服务端), 不在本端重发', async () => {
+  it('终稿回执一直未知 → 同 opId 同正文有界重发对账, 仍未知才不确认(交回服务端)', async () => {
     const h = autoHarness((p) => (p.purpose === 'turn-final' ? null : okWithId()));
     const done = h.carrier.publishFinal({ status: 'ok', finalText: '答案' });
-    await advance(1_000);
+    await advance(5_000);
     await expect(done).resolves.toBe(false);
-    expect(h.sent.filter((m) => m.payload.purpose === 'turn-final')).toHaveLength(1);
+    const finals = h.sent.filter((m) => m.payload.purpose === 'turn-final');
+    // 首发 + 2 次原样重发; 不换 opId、不回落 HTML(没有应答就不能判定 Rich 没落地)。
+    expect(finals).toHaveLength(3);
+    expect(finals[1].payload).toEqual(finals[0].payload);
+    expect(finals[2].payload).toEqual(finals[0].payload);
+  });
+
+  it('终稿回执未知、重发时服务端回显原结果 → 对上账, 照常确认', async () => {
+    let seen = 0;
+    const h = autoHarness((p) => {
+      if (p.purpose !== 'turn-final') return okWithId();
+      seen += 1;
+      return seen === 1 ? { ok: false, errorCode: MESSAGE_OP_ERROR_OUTCOME_UNKNOWN } : okWithId();
+    });
+    const done = h.carrier.publishFinal({ status: 'ok', finalText: '答案' });
+    await advance(0);
+    await expect(done).resolves.toBe(true);
+    const finals = h.sent.filter((m) => m.payload.purpose === 'turn-final');
+    expect(finals).toHaveLength(2);
+    expect(finals[1].payload.opId).toBe(finals[0].payload.opId);
   });
 
   it('TURN_UNAVAILABLE → 不确认, 之后不再出站', async () => {

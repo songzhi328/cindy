@@ -5064,13 +5064,39 @@ describe('官方 Telegram 终稿 / 交互卡 / 命令菜单由客户端发布', 
       d.handleDispatch('conn-1', telegramDispatch(), c.send);
       await tick();
       fr.finish({ finalText: '答案' });
-      await vi.advanceTimersByTimeAsync(31_000);
+      await vi.advanceTimersByTimeAsync(3 * 31_000) // 首发 + 2 次原样重发各等满回执超时;
       await tick(20);
       const end = c.last('turn.end')!.payload;
       expect(end.clientFinal).toEqual({ complete: false });
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('持久出箱写不进兜底帧: 不走客户端终稿, turn.end 交给服务端照旧发布', async () => {
+    const ledger = memoryTerminalLedger();
+    const set = ledger.set.bind(ledger);
+    // 发布前那次 pending 写入失败(磁盘满 / 锁冲突), 之后的写入照常。
+    let failNext = true;
+    ledger.set = (record) => {
+      if (failNext && record.delivery === 'pending') {
+        failNext = false;
+        return false;
+      }
+      return set(record);
+    };
+    const fr = fakeRunner();
+    const { d } = makeDispatcher({ runner: fr.runner, terminalLedger: ledger });
+    const c = respondingCollector(d, () => ({}));
+    d.onConnected('conn-1', c.send, ALL_FEATURES);
+    d.handleDispatch('conn-1', telegramDispatch(), c.send);
+    await tick();
+    fr.finish({ finalText: '答案' });
+    await tick(20);
+    expect(ops(c.sent, 'turn-final')).toHaveLength(0);
+    const end = c.last('turn.end')!.payload;
+    expect(end.clientFinal).toBeUndefined();
+    expect(end.finalText).toBe('答案');
   });
 
   it('带附件的成功轮次不走客户端终稿: 不发 turn-final, turn.end 原样带附件交给服务端', async () => {
@@ -5111,7 +5137,7 @@ describe('官方 Telegram 终稿 / 交互卡 / 命令菜单由客户端发布', 
       await tick(20);
       expect(reconnected.sent.filter((m) => m.type === 'turn.end')).toHaveLength(0);
 
-      await vi.advanceTimersByTimeAsync(31_000);
+      await vi.advanceTimersByTimeAsync(3 * 31_000) // 首发 + 2 次原样重发各等满回执超时;
       await tick(20);
       const ends = reconnected.sent.filter((m) => m.type === 'turn.end');
       expect(ends).toHaveLength(1);

@@ -26,6 +26,7 @@ import { callWithTelegramRateLimitRetry, layoutTelegramCard } from '@cindy/im';
 import {
   abortableSleep,
   isMsgOpOutcomeUnknown,
+  MSG_OP_UNKNOWN_REPLAYS,
   msgOpErrorFromResult,
   TELEGRAM_OP_MARKER,
   TelegramMsgOpError,
@@ -41,9 +42,6 @@ export interface OfficialInteractionCard {
   body: string;
   buttons: InteractionButton[];
 }
-
-/** 回执未知的发卡最多原样重发几次(同 opId 同内容, 服务端幂等)。 */
-const CARD_UNKNOWN_REPLAYS = 2;
 
 type CardState = { mode: 'client'; messageId: string } | { mode: 'legacy' } | { mode: 'lost' };
 
@@ -135,7 +133,7 @@ export function createOfficialTelegramCardPublisher(
       } catch (err) {
         const unknown =
           err instanceof TelegramMsgOpError && err.errorCode === undefined && !err.serverCode;
-        if (unknown && isLive() && replays < CARD_UNKNOWN_REPLAYS) {
+        if (unknown && isLive() && replays < MSG_OP_UNKNOWN_REPLAYS) {
           replays += 1;
           continue;
         }

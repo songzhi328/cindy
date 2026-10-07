@@ -529,7 +529,9 @@ bot 同一份过程载体与渲染（见 `docs/product-rules/telegram-bot-parity
   `MESSAGE_OP_ERROR_*`）；`channelErrorCode?: number | null`：Telegram 原生 error_code
   原样透传，`error` 放渠道原文。
 - 幂等：服务端按 opId + 内容指纹去重；回执未知（含 `OUTCOME_UNKNOWN`）时客户端原样重发
-  同 opId 同正文，不换号、不换正文。
+  同 opId 同正文，不换号、不换正文。服务端有应答时只回显原结果；也没有应答时每个 opId
+  只重新执行一次，之后回显缓存的 `OUTCOME_UNKNOWN`。卡片与终稿段最多原样重发 2 次，仍未知
+  就放弃（终稿以 `clientFinal.complete=false` 交回）；进度首帧每个节流窗口重发一次。
 
 任一侧缺席时行为与本能力出现前逐字相同；无数据库迁移、Mobile 冷更或部署顺序要求。实现见
 `hook-control/telegramTurnCarrier.ts`、`telegramMsgOp.ts` 与

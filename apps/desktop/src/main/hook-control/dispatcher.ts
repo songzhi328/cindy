@@ -912,11 +912,12 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     /**
      * 由本端发布成功终稿; 不发布(未协商 / 不适用)时等同 finish() 并返回 null。
      * `beforePublish` 在真正发出第一条终稿 op 之前同步调用(调用方在此把 turn.end
-     * 写进持久出箱, 保证发布中途崩溃时服务端仍能按出箱重放兜底)。
+     * 写进持久出箱, 保证发布中途崩溃时服务端仍能按出箱重放兜底); 它返回 false(兜底
+     * 没写进去)时同样不发布, 交回服务端。
      */
     publishFinal(
       input: ClientFinalInput,
-      beforePublish?: () => void,
+      beforePublish?: () => boolean,
     ): Promise<TurnEndClientFinal | null>;
     close(): void;
   } {
@@ -968,7 +969,11 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
           return null;
         }
         const target = ensureCarrier();
-        beforePublish?.();
+        if (beforePublish && !beforePublish()) {
+          target.finish();
+          stop();
+          return null;
+        }
         try {
           return { complete: await target.publishFinal(input) };
         } finally {
@@ -1931,12 +1936,16 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       const clientFinal = await turnCarrier.publishFinal(
         { status, finalText: turnEnd.finalText, attachments: turnEnd.attachments },
         () => {
-          publishingClientFinals.add(publishingKey);
           persistedBeforePublish = persistTerminal({
             ...terminalRecord,
             turnEnd: durableTurnEnd(turnEnd),
             delivery: 'pending',
           });
+          // 兜底写不进出箱就不走本端发布: 发布中途退出时服务端将收不到任何收口。没配
+          // 出箱(测试)时与旧路径一样本就没有持久兜底, 照常发布。
+          const durable = persistedBeforePublish || !terminalLedger;
+          if (durable) publishingClientFinals.add(publishingKey);
+          return durable;
         },
       );
       // 带附件的轮次不走本端发布(isClientFinalEligible), 这里的 turnEnd 不含附件。

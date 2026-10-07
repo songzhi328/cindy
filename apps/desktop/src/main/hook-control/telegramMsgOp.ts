@@ -123,6 +123,13 @@ export class TelegramMsgOpError extends Error {
   }
 }
 
+/**
+ * 回执未知时同 opId、同内容最多原样重发几次(卡片与终稿段共用)。服务端拿到过 Telegram
+ * 应答的, 重发只回显原结果(对上账、不重复); 服务端也没应答的, 每个 opId 只重新执行一次,
+ * 之后回显缓存的 OUTCOME_UNKNOWN。仍未知就按各自路径放弃。
+ */
+export const MSG_OP_UNKNOWN_REPLAYS = 2;
+
 /** 回执未知: 没收到 / 超时 / 断线, 或服务端明说调用结果未知。 */
 export function isMsgOpOutcomeUnknown(result: MessageOpResultPayload | null): boolean {
   return result === null || result.errorCode === MESSAGE_OP_ERROR_OUTCOME_UNKNOWN;
