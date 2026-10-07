@@ -81,7 +81,8 @@ Telegram / Slack / X）是同一件事的两套实现：把渠道里的一条消
    仍在发布、正式 `turn.end` 还没进入发送 / 缓冲路径时，重连不重放出箱里的兜底帧；终稿段
    回执未知先同 opId 有界重发对账，仍未知才交回。
 9. **明确停止 = 与桌面 Stop 同一语义**：撤自动续跑与退避簿记、取消上下文溢出恢复、暂停
-   Goal、停 coordinator（中止当前一轮、清理待决交互）。用户喊停后不得有任何自动续跑原地复活；
+   Goal、停 coordinator（中止当前一轮、清 coordinator 队列、清理待决交互）。用户喊停后不得有
+   任何自动续跑原地复活；hook 自有队列（`queues`）不在此列，并入 coordinator 前的语义见 §6；
    Goal 落盘失败只能在中止之后报错，不能挡住停止。
 10. **hook 的续跑观察不把自己的轮次当成桌面轮次**：hook 轮次一旦经 coordinator 派发，
     `subscribeUiTurnDispatching` 必须能按 clientId 认出它（否则会误撤续跑）。
@@ -141,6 +142,7 @@ inbound ──► admitted ──► queued? ──► dispatching ──► run
 | 渠道轮次的中断自动续跑 / 错误横幅 / 上下文恢复 | 无 | 无 | 迁到 coordinator 后自然覆盖（与桌面同语义）；与 `maker-core-and-agent-behavior.md` 「IM 绑定任务不进图片历史自动恢复」那条要一并核对 |
 | 排队消息在桌面端可见 / 可删 | 不可见 | 不可见 | 迁到 coordinator 后自然可见、可删（删除即视同撤回：IM 撤排队表情，hook 回 `turn.end(cancelled)`） |
 | 排队上限 | 无上限 | 每会话 20 | 各自保留：IM 不限，hook 仍按 20 拒收 |
+| 停止时同任务已排队的消息 | `/stop` 一并清掉 `sendQueue` | 服务端 `/stop` 只对正在跑的那一个 requestId 发 `task.cancel`；desktop hook 队列里同任务已排队的请求照常接着跑（本 PR 前即如此） | 未改：一并清掉等于替用户丢弃没被取消的请求、并以 cancelled 收口，属产品语义；随批次 3（hook 队列并入 coordinator）一起定 |
 | 插话（steer） | 无 | 无 | 不新增 |
 | 模型准入（`openSession`） | 只做凭证检查 | 新任务做路由检查 | 已按 Dash 指定改走 `openSession` 准入：新任务的模型 / 来源 / 推理强度 / Fast 不被支持时直接拒绝（文案「不会自动更换模型或供应商」），准入还会规范化来源与推理强度；渠道默认配置若指向已停用的模型，新任务会建不出来（以前会照建） |
 | live session 改走 `bootstrapSession` | 不注入项目上下文 / Orca 指令 | 同左 | 未改：改了等于给 IM / hook 任务新增项目上下文与 Orca 指令注入、目录授权准备等行为，属产品决定 |

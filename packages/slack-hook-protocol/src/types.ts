@@ -1509,9 +1509,11 @@ export interface MessageOpPayload {
  * (messageId 必须是这一轮登记过的进度消息; 服务端在 turn.end 收口时照旧兜底清理)。
  *
  * `'turn-final'`: 客户端发布 `requestId` 那一轮**成功**的终稿(HOOK_FEATURE_TELEGRAM_FINAL_OPS)。
- * 只用于 `send`(tier rich / html / plain)与 `media`, 必须带 `finalPart`。服务端:
- *   - 核验这一轮仍在运行、属于该设备; turn.end 已到或不归该设备时回
- *     MESSAGE_OP_ERROR_TURN_UNAVAILABLE;
+ * 只用于 `send`(tier rich / html / plain), 必须带 `finalPart`; `finalPart=0` 是续跑锚点,
+ * 只能是文字段。协议形状仍允许 `media`, 但服务端一律回 MESSAGE_OP_ERROR_UNSUPPORTED_PARAMETERS
+ * —— 附件始终由服务端随 turn.end 发布, desktop 不发。服务端:
+ *   - 核验这一轮仍在运行、属于该设备; turn.end 已到、不归该设备或私聊草稿模式(终稿随
+ *     草稿通道由服务端发布)时回 MESSAGE_OP_ERROR_TURN_UNAVAILABLE;
  *   - 投递位置照旧由服务端决定(topic 取 lane; finalPart=0 按服务端终稿首段同一回复
  *     引用规则; 其余段不引用), 消息**会推送**(不带 disable_notification, 除非 silent);
  *   - 每条消息登记 botAuthored route(requestId 同一轮, 非 terminal), 并记为「客户端
@@ -1596,17 +1598,18 @@ export const HOOK_FEATURE_TELEGRAM_PROGRESS_OPS = 'telegram-progress-ops-v1';
 /**
  * 双向能力标识: 官方 Telegram **成功轮次**的终稿由 desktop 用与个人 bot 同一套收口
  * (@cindy/im `startTelegramStreaming` 的 finalize: Rich → HTML → 纯文本、分块、落地后
- * 删进度消息)经 `msg.op`(`purpose: 'turn-final'`)发布; 附件经 `media` 发布。须与
- * HOOK_FEATURE_MESSAGE_OPS 同时协商, 只在 telegram 连接上声明。
+ * 删进度消息)经 `msg.op`(`purpose: 'turn-final'`)发布。须与 HOOK_FEATURE_MESSAGE_OPS
+ * 同时协商, 只在 telegram 连接上声明。
  *
  * **终稿必达不降级**: desktop 先把 turn.end 写进本地持久出箱, 再发布, 最后发 turn.end
  * 并用 `clientFinal` 说明结果。服务端只在 `clientFinal.complete === true` 时跳过自己
  * 渲染; 否则(未完成 / 缺席 / 重启后从出箱重放)删掉本轮已落地的客户端终稿段并照旧自己
  * 发布 —— 最坏是一次重新发布, 不会缺答案也不会两份并存。
  *
- * 只覆盖普通轮次的 `status: 'ok'`。失败 / 取消 / 续跑轮(原位修正旧终稿)/ 正文恰为
- * NO_REPLY(ambient 判定在服务端)/ 附件超出服务端单轮上限时, desktop 不发 `turn-final`,
- * 由服务端按 turn.end 照旧处理。
+ * 只覆盖普通轮次、不带附件的 `status: 'ok'`。失败 / 取消 / 续跑轮(原位修正旧终稿)/
+ * 正文恰为 NO_REPLY(ambient 判定在服务端)/ **带任何附件**时, desktop 不发 `turn-final`,
+ * 由服务端按 turn.end 照旧处理; turn.end 带附件时服务端也不认 `clientFinal`(附件始终由
+ * 服务端发送)。
  */
 export const HOOK_FEATURE_TELEGRAM_FINAL_OPS = 'telegram-final-ops-v1';
 
@@ -1631,7 +1634,7 @@ export const HOOK_FEATURE_TELEGRAM_COMMANDS = 'telegram-commands-v1';
  */
 export interface TurnEndClientFinal {
   /**
-   * true = 本轮全部终稿段与附件都拿到了成功回执: 服务端不再渲染 finalText / attachments,
+   * true = 本轮全部终稿段都拿到了成功回执: 服务端不再渲染 finalText,
    * 把 finalPart=0 那条提升为续跑锚点(terminal route), 照常做收口副作用(群中继
    * —— 文本取本帧 finalText、消息 id 取锚点; 清理进度消息与未收口卡片; 终态表情;
    * inflight 移除)。
@@ -1642,10 +1645,11 @@ export interface TurnEndClientFinal {
 
 /**
  * provider.commands.set(desktop -> server): 官方 Telegram 命令菜单
- * (HOOK_FEATURE_TELEGRAM_COMMANDS)。每次握手成功后发一次; 服务端把它持久化为该设备
- * 绑定 principal 的菜单, 立即并在之后每次需要重设菜单时(启动 / 重新绑定)按
- * `{type:'chat', chat_id: principalId}` 作用域调用 setMyCommands。服务端只校验形状
- * 与 Telegram 限制, 不改文案、不增删命令。
+ * (HOOK_FEATURE_TELEGRAM_COMMANDS)。每次握手成功后发一次; 服务端**只存内存、不落库**,
+ * 按 `{type:'chat', chat_id: principalId}` 作用域调用 setMyCommands。服务端只管理默认
+ * 菜单与 zh / ja / ko, 每次全量重写(缺席的语言写空, 其它语言码含显式 'en' 忽略); 只有该
+ * 设备当前仍协商本能力时才用它的菜单。服务端重启后到 desktop 重连前(以及设备离线期间)
+ * 用服务端自己的默认菜单。服务端只校验形状与 Telegram 限制, 不改文案、不增删命令。
  */
 export interface ProviderCommandsSetPayload {
   provider: 'telegram';

@@ -541,7 +541,7 @@ bot 同一份过程载体与渲染（见 `docs/product-rules/telegram-bot-parity
 渲染）：
 
 - `telegram-final-ops-v1`：普通成功轮次的终稿经 `purpose: 'turn-final'`（`send` 带
-  `finalPart`；协议也允许附件走 `media`，桌面端目前不用：带附件的轮次整轮随 `turn.end`
+  `finalPart`；协议形状仍允许 `media`，但服务端一律拒收，桌面端也不发：带附件的轮次整轮随 `turn.end`
   交给服务端，因为持久出箱只存终态文本，本端上传附件中途退出会丢附件）发布；
   `TurnEndPayload.clientFinal?: { complete }` 告诉服务端是否全部确认。complete 时服务端
   不再渲染、提升续跑锚点并做收口副作用；否则删掉已落地的客户端终稿段并照旧自己发布。
