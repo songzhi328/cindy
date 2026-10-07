@@ -77,15 +77,15 @@ export async function openChannelSession<T>(
   const { value } = await openSession(
     { id, body, ...(assertAccount ? { assertCurrent: assertAccount } : {}) },
     async (row, assertCurrent) =>
-    commit(
-      {
-        model: row.model,
-        providerId: row.providerId ?? null,
-        ...(route.effort !== undefined ? { effort: row.effort as Effort } : {}),
-        ...(route.fastMode !== undefined ? { fastMode: row.fastMode } : {}),
-      },
-      assertCurrent,
-    ),
+      commit(
+        {
+          model: row.model,
+          providerId: row.providerId ?? null,
+          ...(route.effort !== undefined ? { effort: row.effort as Effort } : {}),
+          ...(route.fastMode !== undefined ? { fastMode: row.fastMode } : {}),
+        },
+        assertCurrent,
+      ),
   );
   return value;
 }
