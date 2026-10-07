@@ -5188,6 +5188,47 @@ describe('官方 Telegram 终稿 / 交互卡 / 命令菜单由客户端发布', 
     expect(c.ofType('interaction.cancel')).toHaveLength(0);
   });
 
+  it('drain 超时后仍在途的卡片操作: 换账号重连后不经新账号的同名连接发出', async () => {
+    vi.useFakeTimers();
+    try {
+      const fr = fakeRunner();
+      const { d } = makeDispatcher({ runner: fr.runner });
+      // 发卡撞 429, 要退避 20s: 这一轮收口时 drain(5s)等不到它。
+      const c = respondingCollector(d, (p) =>
+        p.purpose === 'interaction-card'
+          ? { ok: false, channelErrorCode: 429, retryAfterMs: 20_000, error: 'Too Many Requests' }
+          : {},
+      );
+      d.onConnected('conn-1', c.send, ALL_FEATURES);
+      d.handleDispatch('conn-1', telegramDispatch(), c.send);
+      await tick();
+      fr.calls[0].onInteraction!({
+        interactionId: 'i-1',
+        kind: 'permission',
+        title: '🔐 权限请求: Bash',
+        body: '工具: `Bash`',
+        buttons: [{ id: 'perm:allow', label: '允许一次', style: 'primary' }],
+      });
+      await tick();
+      expect(ops(c.sent, 'interaction-card')).toHaveLength(1);
+      fr.finish();
+      await vi.advanceTimersByTimeAsync(6_000);
+      await tick(20);
+      expect(c.ofType('turn.end')).toHaveLength(1);
+
+      await d.deactivateAccount();
+      d.activateAccount();
+      const next = respondingCollector(d, () => ({}));
+      d.onConnected('conn-1', next.send, ALL_FEATURES);
+      await vi.advanceTimersByTimeAsync(20_000);
+      await tick(20);
+      expect(ops(next.sent, 'interaction-card')).toHaveLength(0);
+      expect(next.ofType('interaction.request')).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('卡片 op 被明确拒绝 → 回落 interaction.request, 收口也走 interaction.cancel', async () => {
     const fr = fakeRunner();
     const { d } = makeDispatcher({ runner: fr.runner });

@@ -903,6 +903,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     connectionId: string,
     requestId: string,
     externalKey: string,
+    accountGeneration: number,
   ): {
     update(markdown: string): void;
     /** 不由本端发布终稿时的收口: 冲刷最后一帧进度后停下(wire 上先于 turn.end)。 */
@@ -928,7 +929,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
           requestId,
           externalKey,
           directMessage: deriveLaneKind(externalKey) === 'dm',
-          getSend: () => sendFns.get(connectionId),
+          getSend: () => sendForGeneration(connectionId, accountGeneration),
           router: telegramOpRouter,
           log,
         });
@@ -989,6 +990,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     connectionId: string,
     requestId: string,
     externalKey: string,
+    accountGeneration: number,
     legacy: OfficialTelegramCardPublisherDeps['legacy'],
   ): OfficialTelegramCardPublisherDeps['legacy'] & {
     /** 等在途的发卡 / 收口编辑结束(有界), 然后不再纳入账号切换的统一停止 —— 这一轮已收口。 */
@@ -1007,7 +1009,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
             connectionId,
             requestId,
             externalKey,
-            getSend: () => sendFns.get(connectionId),
+            getSend: () => sendForGeneration(connectionId, accountGeneration),
             router: telegramOpRouter,
             legacy,
             log,
@@ -1028,7 +1030,8 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
         if (!publisher) return;
         await publisher.drain();
         // 这一轮已收口: 从账号切换的统一停止集合里摘掉, 免得每轮一个、只增不减。
-        // 迟到的收口编辑(如共享权限在桌面端被决定)仍可经闭包里的 publisher 发出。
+        // 迟到的收口编辑(如共享权限在桌面端被决定)与 drain 超时后仍在途的操作仍可经
+        // 闭包里的 publisher 发出, 但发送器绑定本轮账号代次: 换账号后视同离线。
         activeCardPublishers.delete(publisher);
       },
     };
@@ -1177,6 +1180,18 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
 
   function isCurrentGeneration(generation: number): boolean {
     return accountActive && generation === accountGeneration;
+  }
+
+  /**
+   * 一轮的出站发送器: 只在这一轮所属的账号代次仍是当前代次时给出连接, 否则视同离线。
+   * 换账号后同名 connectionId 可能已是新账号的连接 —— 迟到的卡片收口、drain 超时后仍在
+   * 途的操作、429 退避后的重试都不能借它发出旧账号的内容。
+   */
+  function sendForGeneration(
+    connectionId: string,
+    generation: number,
+  ): ((m: HookMessage) => boolean) | undefined {
+    return isCurrentGeneration(generation) ? sendFns.get(connectionId) : undefined;
   }
 
   function ackKey(connectionId: string, requestId: string): string {
@@ -1502,7 +1517,12 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     // 续跑轮同样由本端驱动进度消息(新建一条, 不改写被续的旧终稿 —— 那条由服务端
     // 在终稿时原位修正, 本轮进度消息随后由服务端清理)。
     const turnCarrier = messageLifecycle
-      ? telegramTurnCarrier(entry.connectionId, requestId, entry.externalKey)
+      ? telegramTurnCarrier(
+          entry.connectionId,
+          requestId,
+          entry.externalKey,
+          entry.accountGeneration,
+        )
       : null;
     let claimed = false;
     // runner 可能在 watch() 里**同步**收口(会话已不在进程里就直接 onAbandon),
@@ -1722,7 +1742,12 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       task.run.source,
     );
     const turnCarrier = messageLifecycle
-      ? telegramTurnCarrier(task.connectionId, task.requestId, task.externalKey)
+      ? telegramTurnCarrier(
+          task.connectionId,
+          task.requestId,
+          task.externalKey,
+          task.accountGeneration,
+        )
       : null;
 
     // 进度快照直发不缓存: 断线期间的中间帧没有补发价值(turn.end 会带最终
@@ -1739,11 +1764,11 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     // 交互超时会按安全默认自决, 任务不会卡死
     const legacyCards: OfficialTelegramCardPublisherDeps['legacy'] = {
       open(card) {
-        const send = sendFns.get(task.connectionId);
+        const send = sendForGeneration(task.connectionId, task.accountGeneration);
         if (send) send(makeInteractionRequest({ requestId: task.requestId, ...card }));
       },
       close(interactionId, reason) {
-        const send = sendFns.get(task.connectionId);
+        const send = sendForGeneration(task.connectionId, task.accountGeneration);
         if (send) {
           send(makeInteractionCancel({ requestId: task.requestId, interactionId, reason }));
         }
@@ -1752,7 +1777,13 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     // 官方 Telegram 协商了 telegram-card-ops-v1 时卡片由本端渲染发布, 否则(含 Slack /
     // X)走 interaction.request / cancel 旧路径。
     const cards = messageLifecycle
-      ? telegramCardPublisher(task.connectionId, task.requestId, task.externalKey, legacyCards)
+      ? telegramCardPublisher(
+          task.connectionId,
+          task.requestId,
+          task.externalKey,
+          task.accountGeneration,
+          legacyCards,
+        )
       : null;
     const onInteraction = (card: {
       interactionId: string;
