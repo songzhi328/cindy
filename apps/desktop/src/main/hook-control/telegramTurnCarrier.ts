@@ -13,8 +13,8 @@
  * `TelegramStreamingDeps` 落到 msg.op 上:
  *   - 过程帧 send / edit / delete → `purpose: 'turn-progress'`(首帧 silent, 与服务端
  *     旧进度消息一致);
- *   - 终稿段 / Rich 终稿 → `purpose: 'turn-final'` + `finalPart`; 私聊首段挂完成特效;
- *   - 附件 → 终稿文字之后的 `media`(连续图片合成相册)。
+ *   - 终稿段 / Rich 终稿 → `purpose: 'turn-final'` + `finalPart`; 私聊首段挂完成特效。
+ *     带附件的轮次不由本端发布(见 isClientFinalEligible)。
  * 投递位置(topic、回复引用、owner 私聊改投)仍由服务端按这一轮的策略决定。
  *
  * 幂等: 过程帧首个 send 的 opId 只在拿到定案回执后换号, 回执未知时**原样**重发
@@ -35,7 +35,6 @@ import {
   callWithTelegramRateLimitRetry,
   chunkTelegramSource,
   editTelegramHtmlWithFallback,
-  isTelegramBadRequest,
   markdownToTelegramHtml,
   sendTelegramHtmlWithFallback,
   startTelegramTurnCarrier,
@@ -56,20 +55,14 @@ import {
 /** 私聊成功终稿首段的完成特效(Telegram message_effect_id), 与服务端现行取值一致。 */
 export const TELEGRAM_DM_COMPLETION_EFFECT_ID = '5107584321108051014';
 
-/**
- * 服务端单轮附件上限(超出时服务端会发截断 / 超限提示, 那些提示文案在服务端)。
- * 超出任一条就不由本端发布终稿, 整轮交回服务端照旧处理。
- */
-export const TELEGRAM_FINAL_ATTACHMENT_LIMITS = {
-  maxItems: 10,
-  maxItemBytes: 20 * 1024 * 1024,
-  maxTotalBytes: 40 * 1024 * 1024,
-} as const;
-
-/** 回执未知的 media 段最多原样重发几次(同 opId 同内容, 服务端幂等)。 */
-const MEDIA_UNKNOWN_REPLAYS = 2;
-
 const NO_REPLY = 'NO_REPLY';
+
+/** Telegram 完整应答后的 4xx(渠道错误码; 服务端自判的 RATE_LIMITED 也映射为 429)。 */
+function isTelegramClientError(err: unknown): boolean {
+  if (!(err instanceof TelegramMsgOpError)) return false;
+  const code = err.errorCode;
+  return typeof code === 'number' && code >= 400 && code < 500;
+}
 
 export interface ClientFinalInput {
   status: 'ok' | 'error' | 'cancelled';
@@ -78,52 +71,18 @@ export interface ClientFinalInput {
 }
 
 /**
- * 这一轮的终稿能不能由本端发布。只覆盖普通成功轮次; 失败 / 取消 / 空正文 / NO_REPLY
- * (ambient 判定在服务端)/ 附件超出服务端单轮上限都交回服务端按 turn.end 照旧处理。
+ * 这一轮的终稿能不能由本端发布。只覆盖普通成功、不带附件的轮次; 失败 / 取消 / 空正文 /
+ * NO_REPLY(ambient 判定在服务端)/ 带附件都交回服务端按 turn.end 照旧处理。
+ *
+ * 带附件不由本端发布: 持久出箱只存终态文本(附件字节不进 JSON 持久化), 本端逐段上传
+ * 附件期间退出 / 崩溃时, 重启重放的兜底帧没有附件, 服务端接管后附件就丢了。整轮随
+ * turn.end 交给服务端, 附件与旧路径一样由服务端承载。
  */
 export function isClientFinalEligible(input: ClientFinalInput): boolean {
   if (input.status !== 'ok') return false;
+  if ((input.attachments?.length ?? 0) > 0) return false;
   const text = input.finalText.trim();
-  if (text === '' || text === NO_REPLY) return false;
-  const attachments = input.attachments ?? [];
-  if (attachments.length > TELEGRAM_FINAL_ATTACHMENT_LIMITS.maxItems) return false;
-  let total = 0;
-  for (const attachment of attachments) {
-    const bytes = base64Bytes(attachment.dataBase64);
-    if (bytes > TELEGRAM_FINAL_ATTACHMENT_LIMITS.maxItemBytes) return false;
-    total += bytes;
-  }
-  return total <= TELEGRAM_FINAL_ATTACHMENT_LIMITS.maxTotalBytes;
-}
-
-function base64Bytes(data: string): number {
-  const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
-  return Math.max(0, Math.floor((data.length * 3) / 4) - padding);
-}
-
-/** 附件按服务端现行规则成组: 连续 2–10 张图片合成相册, 其余逐条。 */
-export function groupFinalAttachments(
-  attachments: readonly TaskAttachment[],
-): Array<{ items: TaskAttachment[]; album: boolean }> {
-  const groups: Array<{ items: TaskAttachment[]; album: boolean }> = [];
-  let run: TaskAttachment[] = [];
-  const flushRun = (): void => {
-    for (let i = 0; i < run.length; i += 10) {
-      const items = run.slice(i, i + 10);
-      groups.push({ items, album: items.length >= 2 });
-    }
-    run = [];
-  };
-  for (const attachment of attachments) {
-    if (attachment.mimeType.startsWith('image/')) {
-      run.push(attachment);
-      continue;
-    }
-    flushRun();
-    groups.push({ items: [attachment], album: false });
-  }
-  flushRun();
-  return groups;
+  return text !== '' && text !== NO_REPLY;
 }
 
 export interface OfficialTelegramTurnCarrierDeps {
@@ -150,7 +109,7 @@ export interface OfficialTelegramTurnCarrier {
   finish(): void;
   /**
    * 由本端发布成功终稿(调用方先确认 isClientFinalEligible 与能力协商)。
-   * 返回 true = 全部终稿段与附件都拿到成功回执(turn.end 带 clientFinal.complete=true);
+   * 返回 true = 全部终稿段都拿到成功回执(turn.end 带 clientFinal.complete=true);
    * false = 没有完整确认, 交回服务端。之后载体永久停止。
    */
   publishFinal(input: ClientFinalInput): Promise<boolean>;
@@ -176,8 +135,6 @@ export function createOfficialTelegramTurnCarrier(
   let progressDeleteSeq = 0;
   /** 每个终稿段的 opId 序号: 只在拿到明确失败(含 429 / HTML 400 回落)后换号。 */
   const finalAttempt = new Map<number, number>();
-  /** 已用过的最大终稿段号(Rich / HTML 段之后的附件从下一段起编号)。 */
-  let lastFinalPart = -1;
   const abort = new AbortController();
   const sleep = abortableSleep(abort.signal);
   const isLive = (): boolean => !closed && !turnStopped;
@@ -268,7 +225,6 @@ export function createOfficialTelegramTurnCarrier(
 
   /** 终稿段: 不在本端对未知回执重试(交回服务端), 明确失败换号以便回落重发。 */
   async function finalOp(part: number, action: MessageOpAction): Promise<MessageOpResultPayload> {
-    lastFinalPart = Math.max(lastFinalPart, part);
     const attempt = finalAttempt.get(part) ?? 0;
     const opId = `${requestId}${TELEGRAM_OP_MARKER.final}${part}:${attempt}`;
     const result = await request(opId, 'turn-final', action, part);
@@ -341,63 +297,28 @@ export function createOfficialTelegramTurnCarrier(
       return messageIdOf(result, 'final send');
     },
     async sendFinal(markdown) {
-      // Rich 是终稿的新消息; Telegram 明确拒绝(4xx)= 本条 Rich 不可用, 交给 finalize
-      // 回落 HTML。拿不到应答 / 服务端拒绝码必须抛出, 不能伪装成可安全降级。
+      // Rich 是终稿的新消息; Telegram 完整应答后的任一 4xx(含退避重试后仍 429)= 这条
+      // Rich 没有落地, 交给 finalize 回落 HTML —— 与个人 bot sendRichFinal 同一判据。
+      // 拿不到应答 / 服务端自判拒绝码(无渠道错误码)必须抛出, 不能伪装成可安全降级。
       try {
         const result = await retry(() =>
           finalOp(0, { kind: 'send', text: markdown, tier: 'rich', ...effectFor(0) }),
         );
         return messageIdOf(result, 'rich final');
       } catch (err) {
-        if (isTelegramBadRequest(err) || (err as { errorCode?: number }).errorCode === 404) {
-          return null;
-        }
+        if (isTelegramClientError(err)) return null;
         throw err;
       }
     },
     // 官方终稿的受管图片已由 runner 收成附件、正文里的引用已剥掉: 这里不会有图片
-    // 引用, 附件在 finalize 之后经 media 单独发布。
+    // 引用; 带附件的轮次整轮交回服务端, 不走本端发布。
     chunk: chunkTelegramSource,
     extractImageUrls: () => [],
     uploadImages: async () => {
-      throw new Error('official telegram finals publish attachments via msg.op media');
+      throw new Error('official telegram finals with attachments are published by the server');
     },
   };
   const carrier = startTelegramTurnCarrier(streamingDeps);
-
-  async function publishAttachments(attachments: readonly TaskAttachment[]): Promise<boolean> {
-    for (const group of groupFinalAttachments(attachments)) {
-      const part = lastFinalPart + 1;
-      const action: MessageOpAction = {
-        kind: 'media',
-        album: group.album,
-        items: group.items.map((item, index) => ({
-          // 协议要求非空文件名(服务端上限 256 字); 出站附件缺名时按段内序号命名。
-          name: (item.name || `attachment-${part}-${index + 1}`).slice(0, 256),
-          mimeType: item.mimeType,
-          dataBase64: item.dataBase64,
-        })),
-      };
-      let delivered = false;
-      for (let replay = 0; replay <= MEDIA_UNKNOWN_REPLAYS && !delivered; replay += 1) {
-        try {
-          await retry(() => finalOp(part, action));
-          delivered = true;
-        } catch (err) {
-          // 未知回执: 同 opId 同内容原样重发(finalOp 只在明确失败时换号)。
-          if (err instanceof TelegramMsgOpError && err.errorCode === undefined && !err.serverCode) {
-            continue;
-          }
-          log.warn(
-            `telegram final attachment for ${requestId} failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          return false;
-        }
-      }
-      if (!delivered) return false;
-    }
-    return true;
-  }
 
   const close = (): void => {
     if (closed) return;
@@ -423,8 +344,7 @@ export function createOfficialTelegramTurnCarrier(
       }
       try {
         await carrier.finalize(input.finalText);
-        if (!isLive()) return false;
-        return await publishAttachments(input.attachments ?? []);
+        return isLive();
       } catch (err) {
         log.warn(
           `telegram client final for ${requestId} not confirmed; handing back to the server: ${err instanceof Error ? err.message : String(err)}`,

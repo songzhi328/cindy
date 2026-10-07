@@ -460,7 +460,11 @@ function validateMessageOpPurpose(p: Record<string, unknown>, kind: unknown): st
     }
     return null;
   }
-  const kinds = typeof purpose === 'string' ? MESSAGE_OP_PURPOSE_KINDS[purpose] : undefined;
+  // 只认自有键: 'constructor' / '__proto__' 这类继承属性不能当成合法 purpose。
+  const kinds =
+    typeof purpose === 'string' && Object.hasOwn(MESSAGE_OP_PURPOSE_KINDS, purpose)
+      ? MESSAGE_OP_PURPOSE_KINDS[purpose]
+      : undefined;
   if (!kinds) return 'msg.op.purpose must be one of: turn-progress, turn-final, interaction-card';
   // purpose 按 requestId 归属到一轮(服务端据此核验设备归属并登记消息), 缺了它服务端
   // 无从判断这条消息归谁清理。

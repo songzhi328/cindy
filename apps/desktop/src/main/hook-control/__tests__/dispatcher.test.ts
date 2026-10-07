@@ -5022,7 +5022,7 @@ describe('官方 Telegram 终稿 / 交互卡 / 命令菜单由客户端发布', 
     return { ...c, send };
   }
 
-  it('协商终稿: 先写持久出箱、再经 msg.op 发布, 最后 turn.end 带 clientFinal.complete 且不再带附件', async () => {
+  it('协商终稿: 先写持久出箱、再经 msg.op 发布, 最后 turn.end 带 clientFinal.complete', async () => {
     const ledger = memoryTerminalLedger();
     const fr = fakeRunner();
     const { d } = makeDispatcher({ runner: fr.runner, terminalLedger: ledger });
@@ -5039,26 +5039,22 @@ describe('官方 Telegram 终稿 / 交互卡 / 命令菜单由客户端发布', 
     d.onConnected('conn-1', c.send, ALL_FEATURES);
     d.handleDispatch('conn-1', telegramDispatch(), c.send);
     await tick();
-    fr.finish({
-      finalText: '**答案**',
-      attachments: [{ name: 'a.png', mimeType: 'image/png', dataBase64: 'AAAA' }],
-    });
+    fr.finish({ finalText: '**答案**' });
     await tick(40);
 
     // 发布前出箱里已经有一份「交回服务端」版本的 turn.end(不带 clientFinal)。
     expect(ledgerAtFirstFinal?.delivery).toBe('pending');
     expect(ledgerAtFirstFinal?.turnEnd?.clientFinal).toBeUndefined();
     const finals = ops(c.sent, 'turn-final');
-    expect(finals.map((m) => m.payload.action.kind)).toEqual(['send', 'send', 'media']);
+    expect(finals.map((m) => m.payload.action.kind)).toEqual(['send', 'send']);
     const endIndex = c.sent.findIndex((m) => m.type === 'turn.end');
     expect(endIndex).toBeGreaterThan(c.sent.indexOf(finals[finals.length - 1]));
     const end = c.last('turn.end')!.payload;
     expect(end.clientFinal).toEqual({ complete: true });
-    expect(end.attachments).toBeUndefined();
     expect(ledger.get('conn-1', 'req-1')?.turnEnd?.clientFinal).toEqual({ complete: true });
   });
 
-  it('客户端终稿没有完整确认 → turn.end 带 clientFinal.complete=false 并保留附件(服务端照旧发布)', async () => {
+  it('客户端终稿没有完整确认 → turn.end 带 clientFinal.complete=false(服务端照旧发布)', async () => {
     vi.useFakeTimers();
     try {
       const fr = fakeRunner();
@@ -5067,15 +5063,61 @@ describe('官方 Telegram 终稿 / 交互卡 / 命令菜单由客户端发布', 
       d.onConnected('conn-1', c.send, ALL_FEATURES);
       d.handleDispatch('conn-1', telegramDispatch(), c.send);
       await tick();
-      fr.finish({
-        finalText: '答案',
-        attachments: [{ name: 'a.png', mimeType: 'image/png', dataBase64: 'AAAA' }],
-      });
+      fr.finish({ finalText: '答案' });
       await vi.advanceTimersByTimeAsync(31_000);
       await tick(20);
       const end = c.last('turn.end')!.payload;
       expect(end.clientFinal).toEqual({ complete: false });
-      expect(end.attachments).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('带附件的成功轮次不走客户端终稿: 不发 turn-final, turn.end 原样带附件交给服务端', async () => {
+    const fr = fakeRunner();
+    const { d } = makeDispatcher({ runner: fr.runner });
+    const c = respondingCollector(d, () => ({}));
+    d.onConnected('conn-1', c.send, ALL_FEATURES);
+    d.handleDispatch('conn-1', telegramDispatch(), c.send);
+    await tick();
+    fr.finish({
+      finalText: '答案',
+      attachments: [{ name: 'a.png', mimeType: 'image/png', dataBase64: 'AAAA' }],
+    });
+    await tick(20);
+    expect(ops(c.sent, 'turn-final')).toHaveLength(0);
+    const end = c.last('turn.end')!.payload;
+    expect(end.clientFinal).toBeUndefined();
+    expect(end.attachments).toHaveLength(1);
+  });
+
+  it('发布客户端终稿期间重连: 不重放出箱里的兜底 turn.end, 发布结束后才发正式帧', async () => {
+    vi.useFakeTimers();
+    try {
+      const ledger = memoryTerminalLedger();
+      const fr = fakeRunner();
+      const { d } = makeDispatcher({ runner: fr.runner, terminalLedger: ledger });
+      const c = respondingCollector(d, (p) => (p.purpose === 'turn-final' ? null : {}));
+      d.onConnected('conn-1', c.send, ALL_FEATURES);
+      d.handleDispatch('conn-1', telegramDispatch(), c.send);
+      await tick();
+      fr.finish({ finalText: '答案' });
+      await tick(20);
+      expect(ops(c.sent, 'turn-final').length).toBeGreaterThan(0);
+      expect(ledger.get('conn-1', 'req-1')?.delivery).toBe('pending');
+
+      const reconnected = respondingCollector(d, (p) => (p.purpose === 'turn-final' ? null : {}));
+      d.onConnected('conn-1', reconnected.send, ALL_FEATURES);
+      await tick(20);
+      expect(reconnected.sent.filter((m) => m.type === 'turn.end')).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      await tick(20);
+      const ends = reconnected.sent.filter((m) => m.type === 'turn.end');
+      expect(ends).toHaveLength(1);
+      expect((ends[0] as Extract<HookMessage, { type: 'turn.end' }>).payload.clientFinal).toEqual({
+        complete: false,
+      });
     } finally {
       vi.useRealTimers();
     }

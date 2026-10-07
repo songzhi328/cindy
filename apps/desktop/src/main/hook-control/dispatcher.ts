@@ -849,6 +849,12 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
   >();
   /** 已请求取消的 connectionId + requestId(execute 收口时据此把结果改写为 cancelled)。 */
   const cancelRequested = new Set<string>();
+  /**
+   * 正在由本端发布客户端终稿的 connectionId + requestId。发布前写下的出箱兜底帧
+   * (不带 clientFinal)只为崩溃重启准备: 本进程还在发布时重连, 不能拿它抢先重放,
+   * 否则服务端提前接管、删掉刚落地的终稿段再自己发一遍。发布结束后正常帧照常发送。
+   */
+  const publishingClientFinals = new Set<string>();
   /** 每连接最近一次 welcome 宣告的能力集(turn.reopen 的 feature gate)。 */
   const serverFeatures = new Map<string, readonly string[]>();
   // 官方 bot 的 ack 表情(👀 → 👍/👎) —— 个人 bot 早有, 官方侧靠 msg.op 补上。
@@ -1884,6 +1890,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       ack: task.ack,
     };
     let persistedBeforePublish = false;
+    const publishingKey = ackKey(task.connectionId, task.requestId);
     if (turnCarrier) {
       // 官方 Telegram: 协商了客户端终稿且这一轮适用时, 用个人 bot 同一套收口经 msg.op
       // 发布; 否则冲刷最后一帧进度(wire 上先于 turn.end)后停下, 由服务端照旧发布。
@@ -1892,20 +1899,16 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       const clientFinal = await turnCarrier.publishFinal(
         { status, finalText: turnEnd.finalText, attachments: turnEnd.attachments },
         () => {
+          publishingClientFinals.add(publishingKey);
           persistedBeforePublish = persistTerminal({
             ...terminalRecord,
             turnEnd: durableTurnEnd(turnEnd),
             delivery: 'pending',
           });
         },
-      );
-      if (clientFinal) {
-        const { attachments: _published, ...withoutAttachments } = turnEnd;
-        // 完整发布时附件已经经 media 发出, turn.end 不再携带(服务端也不会再发)。
-        turnEnd = clientFinal.complete
-          ? { ...withoutAttachments, clientFinal }
-          : { ...turnEnd, clientFinal };
-      }
+      ).finally(() => publishingClientFinals.delete(publishingKey));
+      // 带附件的轮次不走本端发布(isClientFinalEligible), 这里的 turnEnd 不含附件。
+      if (clientFinal) turnEnd = { ...turnEnd, clientFinal };
     }
     // 收口编辑先于 turn.end 到达服务端(否则服务端的收口清扫会先把卡片当成未收口)。
     await cards?.drain();
@@ -3107,8 +3110,8 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       // 老实例不宣告 turn.reopen 时必须立刻停用回流, 不能拿上一次的快照发帧。
       serverFeatures.set(connectionId, features ? [...features] : []);
       sendFns.set(connectionId, send);
-      // 官方 Telegram 命令菜单以本端注册表为准: 每次握手都重发一次(服务端持久化并在
-      // 启动 / 重新绑定时复用), 文案跟着桌面端版本走。
+      // 官方 Telegram 命令菜单以本端注册表为准: 每次握手都重发一次(服务端只存内存,
+      // 重启后到本端重连前用它自己的默认菜单), 文案跟着桌面端版本走。
       if (telegramCommandMenus && features?.includes(HOOK_FEATURE_TELEGRAM_COMMANDS)) {
         try {
           send(makeProviderCommandsSet({ provider: 'telegram', menus: telegramCommandMenus() }));
@@ -3201,6 +3204,8 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
         // durable frame during the same reconnect attempt.
         if (flushedRequestIds.has(pending.requestId)) continue;
         if (!pending.turnEnd) continue;
+        // 本进程正在发布客户端终稿: 兜底帧留给崩溃重启, 发布结束后由正常路径发送。
+        if (publishingClientFinals.has(ackKey(connectionId, pending.requestId))) continue;
         if (deliveryAck) {
           // 已在 ACK 缓冲中的条目由本函数开头的循环重放, 不再用文本帧重复补发。
           if (pendingDeliveryTurnEnds.has(ackKey(connectionId, pending.requestId))) continue;

@@ -241,3 +241,18 @@ describe('workspaceKind 在复活 / upsert 冲突时的归属', () => {
     expect(again.workingDir).toBe(PROJECT_DIR);
   });
 });
+
+describe('新任务写库前复核账号代次', () => {
+  it('准入后等锁期间换了账号: 抛错且不写库', async () => {
+    const { openSession } = await import('../../../localDb/sessionOpening');
+    vi.mocked(openSession).mockImplementationOnce(async (input, commit) => {
+      const row = { ...input.body, providerId: null, fastMode: false } as never;
+      const value = await commit!(row, () => {
+        throw new Error('account changed');
+      });
+      return { row, value };
+    });
+    await expect(repo().createSession('bot1', 'u1')).rejects.toThrow('account changed');
+    expect(await db.select().from(sessions)).toHaveLength(0);
+  });
+});

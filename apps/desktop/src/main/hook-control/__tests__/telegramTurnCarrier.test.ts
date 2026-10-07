@@ -18,7 +18,6 @@ import {
 import { createMsgOpResultRouter, isTelegramTurnOpId } from '../telegramMsgOp';
 import {
   createOfficialTelegramTurnCarrier,
-  groupFinalAttachments,
   isClientFinalEligible,
   TELEGRAM_DM_COMPLETION_EFFECT_ID,
 } from '../telegramTurnCarrier';
@@ -409,7 +408,35 @@ describe('官方 Telegram 终稿由客户端发布(turn-final)', () => {
     expect((finals[1].payload.action as { effectId?: string }).effectId).toBeUndefined();
   });
 
-  it('长正文按个人 bot 同一分段逐段发布, finalPart 递增; 附件随后按相册 / 逐条发布', async () => {
+  it.each([
+    [403, 'Forbidden'],
+    [429, 'Too Many Requests'],
+  ])('Rich 收到其它确定 4xx(%i) → 同样回落 HTML, 不交回服务端', async (code, error) => {
+    const h = autoHarness((p) =>
+      p.action.kind === 'send' && p.action.tier === 'rich'
+        ? { ok: false, channelErrorCode: code, error }
+        : okWithId(),
+    );
+    const done = h.carrier.publishFinal({ status: 'ok', finalText: '答案' });
+    await advance(THROTTLE_MS * 10);
+    await expect(done).resolves.toBe(true);
+    const tiers = h.sent
+      .filter((m) => m.payload.purpose === 'turn-final')
+      .map((m) => (m.payload.action as { tier?: string }).tier);
+    expect(tiers.at(-1)).toBe('html');
+  });
+
+  it('Rich 遇服务端自判拒绝码(无渠道错误码) → 不回落, 交回服务端', async () => {
+    const h = autoHarness((p) =>
+      p.purpose === 'turn-final' ? { ok: false, errorCode: 'PERSIST_FAILED' } : okWithId(),
+    );
+    const done = h.carrier.publishFinal({ status: 'ok', finalText: '答案' });
+    await advance(0);
+    await expect(done).resolves.toBe(false);
+    expect(h.sent.filter((m) => m.payload.purpose === 'turn-final')).toHaveLength(1);
+  });
+
+  it('长正文按个人 bot 同一分段逐段发布, finalPart 递增', async () => {
     const h = autoHarness((p) =>
       p.action.kind === 'send' && p.action.tier === 'rich'
         ? { ok: false, channelErrorCode: 404, error: 'Not Found' }
@@ -418,16 +445,7 @@ describe('官方 Telegram 终稿由客户端发布(turn-final)', () => {
     const longText = Array.from({ length: 4 }, (_, i) => `段落 ${i} ${'字'.repeat(2000)}`).join(
       '\n\n',
     );
-    const png = { name: 'a.png', mimeType: 'image/png', dataBase64: 'AAAA' };
-    const done = h.carrier.publishFinal({
-      status: 'ok',
-      finalText: longText,
-      attachments: [
-        png,
-        { ...png, name: 'b.png' },
-        { name: null, mimeType: 'application/pdf', dataBase64: 'AA' },
-      ],
-    });
+    const done = h.carrier.publishFinal({ status: 'ok', finalText: longText });
     await advance(0);
     await expect(done).resolves.toBe(true);
     const finals = h.sent.filter(
@@ -438,14 +456,6 @@ describe('官方 Telegram 终稿由客户端发布(turn-final)', () => {
     const parts = finals.map((m) => m.payload.finalPart);
     expect(parts).toEqual([...parts].sort((a, b) => a! - b!));
     expect(new Set(parts).size).toBe(parts.length);
-    const media = finals.filter((m) => m.payload.action.kind === 'media');
-    expect(media.map((m) => (m.payload.action as { album?: boolean }).album)).toEqual([
-      true,
-      false,
-    ]);
-    expect((media[1].payload.action as { items: Array<{ name: string }> }).items[0].name).toMatch(
-      /^attachment-/,
-    );
     expect(finals.filter((m) => m.payload.action.kind === 'send').length).toBeGreaterThan(1);
   });
 
@@ -495,71 +505,23 @@ describe('官方 Telegram 终稿由客户端发布(turn-final)', () => {
     await expect(done).resolves.toBe(true);
     expect(h.sent.filter((m) => m.payload.purpose === 'turn-final')).toHaveLength(1);
   });
-
-  it('附件 media 回执未知时原样重发同一 op(服务端幂等), 仍未知则不确认', async () => {
-    let mediaSeen = 0;
-    const h = autoHarness((p) => {
-      if (p.action.kind !== 'media') return okWithId();
-      mediaSeen += 1;
-      return mediaSeen === 1 ? null : okWithId();
-    });
-    const done = h.carrier.publishFinal({
-      status: 'ok',
-      finalText: '答案',
-      attachments: [{ name: 'a.pdf', mimeType: 'application/pdf', dataBase64: 'AA' }],
-    });
-    await advance(1_000);
-    await advance(0);
-    await expect(done).resolves.toBe(true);
-    const media = h.sent.filter((m) => m.payload.action.kind === 'media');
-    expect(media).toHaveLength(2);
-    expect(media[1].payload).toEqual(media[0].payload);
-  });
 });
 
-describe('isClientFinalEligible / groupFinalAttachments', () => {
-  const big = (bytes: number) => ({
-    name: 'x',
-    mimeType: 'image/png',
-    dataBase64: 'A'.repeat(Math.ceil((bytes * 4) / 3)),
-  });
-  it('只覆盖成功、非空、非 NO_REPLY、附件在服务端单轮上限内的轮次', () => {
+describe('isClientFinalEligible', () => {
+  it('只覆盖成功、非空、非 NO_REPLY、不带附件的轮次', () => {
     expect(isClientFinalEligible({ status: 'ok', finalText: '答案' })).toBe(true);
     expect(isClientFinalEligible({ status: 'error', finalText: '答案' })).toBe(false);
     expect(isClientFinalEligible({ status: 'cancelled', finalText: '答案' })).toBe(false);
     expect(isClientFinalEligible({ status: 'ok', finalText: '  ' })).toBe(false);
     expect(isClientFinalEligible({ status: 'ok', finalText: ' NO_REPLY ' })).toBe(false);
-    const small = { name: 'a', mimeType: 'image/png', dataBase64: 'AA' };
-    expect(
-      isClientFinalEligible({ status: 'ok', finalText: 'x', attachments: Array(11).fill(small) }),
-    ).toBe(false);
-    expect(
-      isClientFinalEligible({ status: 'ok', finalText: 'x', attachments: [big(21 * 1024 * 1024)] }),
-    ).toBe(false);
+    // 带附件整轮交回服务端: 持久兜底只存文本, 本端上传中途退出会丢附件。
     expect(
       isClientFinalEligible({
         status: 'ok',
-        finalText: 'x',
-        attachments: [big(15e6), big(15e6), big(15e6)],
+        finalText: '答案',
+        attachments: [{ name: 'a.png', mimeType: 'image/png', dataBase64: 'AA' }],
       }),
     ).toBe(false);
-  });
-
-  it('连续 2–10 张图片合成相册, 其余逐条', () => {
-    const img = (n: string) => ({ name: n, mimeType: 'image/png', dataBase64: 'AA' });
-    const doc = { name: 'd', mimeType: 'application/pdf', dataBase64: 'AA' };
-    const groups = groupFinalAttachments([
-      img('1'),
-      doc,
-      img('2'),
-      img('3'),
-      ...Array.from({ length: 11 }, (_, i) => img(`x${i}`)),
-    ]);
-    expect(groups.map((g) => [g.items.length, g.album])).toEqual([
-      [1, false],
-      [1, false],
-      [10, true],
-      [3, true],
-    ]);
+    expect(isClientFinalEligible({ status: 'ok', finalText: '答案', attachments: [] })).toBe(true);
   });
 });

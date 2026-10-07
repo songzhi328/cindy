@@ -165,6 +165,14 @@ describe('telegram-progress-ops-v1: 进度消息由客户端渲染、经 msg.op 
       { opId: 'a', scope: SCOPE, purpose: 'turn-progress', action: { kind: 'send', text: 'x' } },
       { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'turn-progress', action: { kind: 'react', targetMessageId: '1', emoji: '' } },
       { opId: 'a', requestId: 'r', scope: SCOPE, purpose: 'final', action: { kind: 'send', text: 'x' } },
+      // 继承属性名不能当成合法 purpose(查表只认自有键), 也不能让解析器抛异常。
+      ...['constructor', '__proto__', 'toString', 'hasOwnProperty'].map((purpose) => ({
+        opId: 'a',
+        requestId: 'r',
+        scope: SCOPE,
+        purpose,
+        action: { kind: 'send', text: 'x' },
+      })),
     ];
     for (const payload of cases) {
       const parsed = parseHookMessage(withPayload(op({ kind: 'typing' }), payload));

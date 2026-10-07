@@ -423,9 +423,11 @@ export function createImSessionRepo(
           ? { workspaceKind: (defaults.workspaceKind ?? ns.workspaceKind) as 'project' | 'dialogue' }
           : {}),
         title: ns.defaultTitle(userId),
-      }, (admitted) => {
+      }, (admitted, assertCurrent) => {
         row = { ...defaults, ...admitted };
         return withSessionRouteLock(row.id, async () => {
+          // 等锁期间可能换了账号: 写库前就地复核, 不把旧账号的任务写进新账号的库。
+          assertCurrent();
           const priorRows = await db
             .select({ status: sessions.status })
             .from(sessions)
@@ -560,14 +562,18 @@ export function createImSessionRepo(
             workingDir: fresh.workingDir,
             workspaceKind: (fresh.workspaceKind ?? ns.workspaceKind ?? 'project') as 'project' | 'dialogue',
             title: ns.defaultTitle(userId),
-          }, (admitted) => {
+          }, (admitted, assertCurrent) => {
             Object.assign(fresh, admitted);
-            return rotate();
+            return rotate(assertCurrent);
           });
-        const rotate = async (): Promise<{
+        const rotate = async (
+          assertCurrent: () => void,
+        ): Promise<{
           current: ImSessionRow;
           previous: ImSessionRow | null;
         }> => {
+          // 轮换事务写的是当前账号的库: 取库前就地复核账号代次。
+          assertCurrent();
           const client = getDbClient();
           const now = Date.now();
           const markers = ns.extraInsertColumns(botContextId, userId);
