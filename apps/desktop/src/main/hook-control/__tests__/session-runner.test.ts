@@ -631,6 +631,8 @@ describe('hook session-runner 的 userSendAt 时序(未分类误判回归)', () 
 
     await runner.run(baseReq({}));
     expect(vi.mocked(openSession).mock.calls.at(-1)?.[0]).toMatchObject({ id: 'sess-new', body: { model: 'test-model' } });
+    // 账号代次在读配置之前捕获, 一路带进准入(openSession 前后与写库前都复核)。
+    expect(vi.mocked(openSession).mock.calls.at(-1)?.[0]).toMatchObject({ assertCurrent: expect.any(Function) });
     expect(fakeMaker.createSession).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'sess-new', model: 'admitted-model', providerId: 'admitted-provider' }),
     );

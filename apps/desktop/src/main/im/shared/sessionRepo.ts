@@ -34,7 +34,7 @@ import {
 } from '../defaultSessionSettings';
 import { buildImDefaultRouteRecord } from './channelDefaultRoute';
 import { broadcastSessionCreated, broadcastSessionPatched } from './sessionBroadcast';
-import { openChannelSession } from './openChannelSession';
+import { captureChannelAccount, openChannelSession } from './openChannelSession';
 import type { ImOrchestratorConfig, ImSessionNamespace } from './types';
 
 const log = createLogger('im:repo');
@@ -146,6 +146,13 @@ export interface ImSessionRepo {
    */
   getDefaultEffortFor(modelId: string, agentKind?: AgentKind): Effort;
 }
+
+/**
+ * prepareNewSession 产出的默认路由 → 读取它们之前捕获的账号复核函数。调用方常先 prepare
+ * (查凭证 / 回显配置)再 createSession, 账号代次要从 prepare 那一刻算起。只按对象身份
+ * 关联, 不持有引用(WeakMap), 不需要清理。
+ */
+const preparedAccounts = new WeakMap<ImSessionRow, () => void>();
 
 export function createImSessionRepo(
   config: ImOrchestratorConfig,
@@ -380,6 +387,7 @@ export function createImSessionRepo(
     },
 
     async prepareNewSession(botContextId, userId, scopeKey, providerSnapshot) {
+      const assertAccount = captureChannelAccount();
       const id = ns.sessionIdFor(botContextId, userId, scopeKey);
       const workingDir = ns.ensureWorkingDir(botContextId);
       const row = rowFromDefaults(
@@ -391,6 +399,7 @@ export function createImSessionRepo(
       // feishu 群 lane → 渠道设置「群聊新建任务权限档」)。
       const overridden = ns.permissionModeFor?.(userId) ?? null;
       if (overridden) row.permissionMode = overridden;
+      preparedAccounts.set(row, assertAccount);
       return row;
     },
 
@@ -404,8 +413,11 @@ export function createImSessionRepo(
      * 与设置原样保留,绝不让 UNIQUE(sessions.id) 冒泡成用户可见报错(#748)。
      */
     async createSession(botContextId, userId, scopeKey, prepared) {
-      const db = getDbClient().drizzle;
+      // 账号代次从读取默认配置那一刻算起(调用方先 prepare 的, 沿用 prepare 时捕获的)。
       const defaults = prepared ?? (await this.prepareNewSession(botContextId, userId, scopeKey));
+      const assertAccount = preparedAccounts.get(defaults) ?? captureChannelAccount();
+      assertAccount();
+      const db = getDbClient().drizzle;
       const now = Date.now();
       // 新任务经公共入口 openSession(与桌面新建任务同一套模型准入 / Git 初始化 / 账号代次
       // 校验); 建行仍是下面这段确定性 id 的 upsert。准入可能规范化来源 / 推理强度 / Fast,
@@ -485,7 +497,7 @@ export function createImSessionRepo(
             .limit(1);
           return { row: persistedRows[0], isFreshInsert };
         });
-      });
+      }, assertAccount);
       const persistedRow = persisted?.row;
       const result: ImSessionRow = persistedRow
         ? {
@@ -535,6 +547,9 @@ export function createImSessionRepo(
         throw new Error(`${ns.source} does not create a new task for /new`);
       }
       const routeId = ns.sessionIdFor(botContextId, userId, scopeKey);
+      // 账号代次在读旧任务 / 默认配置之前捕获(调用方先 prepare 的, 沿用 prepare 时的):
+      // 中途换账号时不拿旧账号读到的 previous / 默认值去新账号的库里轮换。
+      const assertAccount = (prepared && preparedAccounts.get(prepared)) || captureChannelAccount();
       return withSessionRouteLock(routeId, async () => {
         const previous = await this.peekSession(botContextId, userId, scopeKey);
         const defaults = prepared ?? (await this.prepareNewSession(botContextId, userId, scopeKey));
@@ -565,7 +580,7 @@ export function createImSessionRepo(
           }, (admitted, assertCurrent) => {
             Object.assign(fresh, admitted);
             return rotate(assertCurrent);
-          });
+          }, assertAccount);
         const rotate = async (
           assertCurrent: () => void,
         ): Promise<{

@@ -80,7 +80,10 @@ vi.mock('../../../logger', () => ({
   createLogger: () => mocks.logger,
   maskPath: (p: string) => p,
 }));
+const STABLE_ACCOUNT = vi.hoisted(() => ({}));
 vi.mock('../../../localDb/client/current', () => ({
+  // 账号快照: 同一引用 = 账号没变(sessionRepo 建任务前按它复核账号代次)。
+  getCurrentDbClientSnapshot: () => STABLE_ACCOUNT,
   getDbClient: () => ({
     tx: mocks.tx,
     drizzle: {

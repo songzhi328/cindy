@@ -77,10 +77,17 @@ Telegram / Slack / X）是同一件事的两套实现：把渠道里的一条消
    `sessionInstanceId` 挡住旧实例借用新权限。
 7. **计划对账**只在真实用户轮次注入（官方仅 `source.im` 存在时）。
 8. **终稿必达**（官方）：`turn.end` 先进持久出箱；客户端发布终稿时以 `clientFinal` 交回。
+   带附件的轮次不由客户端发布（出箱只存文本）；本进程仍在发布、正式 `turn.end` 还没进入
+   发送 / 缓冲路径时，重连不重放出箱里的兜底帧。
 9. **明确停止 = 与桌面 Stop 同一语义**：撤自动续跑与退避簿记、取消上下文溢出恢复、暂停
-   Goal、停 coordinator（中止当前一轮、清理待决交互）。用户喊停后不得有任何自动续跑原地复活。
+   Goal、停 coordinator（中止当前一轮、清理待决交互）。用户喊停后不得有任何自动续跑原地复活；
+   Goal 落盘失败只能在中止之后报错，不能挡住停止。
 10. **hook 的续跑观察不把自己的轮次当成桌面轮次**：hook 轮次一旦经 coordinator 派发，
     `subscribeUiTurnDispatching` 必须能按 clientId 认出它（否则会误撤续跑）。
+11. **一轮绑定入口时的账号**：新建任务从**读取**旧任务 / 默认配置之前捕获账号
+    （`captureChannelAccount`，先 prepare 再建的沿用 prepare 时捕获的），经
+    `openChannelSession` 带进 `openSession`，准入前后与写库前都复核；一轮的出站 msg.op
+    （进度、终稿、卡片、旧卡片帧）只经所属账号代次的连接发出，换账号后视同离线。
 
 ## 4. 状态模型（一轮）
 

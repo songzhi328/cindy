@@ -5188,6 +5188,49 @@ describe('官方 Telegram 终稿 / 交互卡 / 命令菜单由客户端发布', 
     expect(c.ofType('interaction.cancel')).toHaveLength(0);
   });
 
+  it('终稿已发、卡片还在 drain 时重连: 仍不重放兜底帧, 正式 turn.end 带 clientFinal.complete', async () => {
+    vi.useFakeTimers();
+    try {
+      const ledger = memoryTerminalLedger();
+      const fr = fakeRunner();
+      const { d } = makeDispatcher({ runner: fr.runner, terminalLedger: ledger });
+      // 卡片收口编辑不回执 → drain 要等满上限; 终稿段正常确认。
+      const responder = (p: OpMessage['payload']) =>
+        p.purpose === 'interaction-card' && p.interactionClosed ? null : {};
+      const c = respondingCollector(d, responder);
+      d.onConnected('conn-1', c.send, ALL_FEATURES);
+      d.handleDispatch('conn-1', telegramDispatch(), c.send);
+      await tick();
+      const req = fr.calls[0];
+      req.onInteraction!({
+        interactionId: 'i-1',
+        kind: 'permission',
+        title: '🔐 权限请求: Bash',
+        body: '工具: `Bash`',
+        buttons: [{ id: 'perm:allow', label: '允许一次', style: 'primary' }],
+      });
+      await tick();
+      req.onInteractionCancel!('i-1', '已处理');
+      fr.finish({ finalText: '答案' });
+      await tick(20);
+      expect(ops(c.sent, 'turn-final').length).toBeGreaterThan(0);
+      expect(c.ofType('turn.end')).toHaveLength(0);
+
+      const reconnected = respondingCollector(d, responder);
+      d.onConnected('conn-1', reconnected.send, ALL_FEATURES);
+      await tick(20);
+      expect(reconnected.ofType('turn.end')).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(6_000);
+      await tick(20);
+      const ends = reconnected.ofType('turn.end');
+      expect(ends).toHaveLength(1);
+      expect(ends[0].payload.clientFinal).toEqual({ complete: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('drain 超时后仍在途的卡片操作: 换账号重连后不经新账号的同名连接发出', async () => {
     vi.useFakeTimers();
     try {

@@ -17,6 +17,7 @@
 import type { AgentKind, Effort, PermissionMode } from '@cindy/maker-core';
 
 import { normalizeDbAgentKind } from '../../../shared/agentKindConversion';
+import { getCurrentDbClientSnapshot } from '../../localDb/client/current';
 import { openSession, type SessionOpenBody } from '../../localDb/sessionOpening';
 
 /** 渠道为新任务选定的路由(准入前)。 */
@@ -42,10 +43,25 @@ export interface AdmittedChannelRoute {
   fastMode?: boolean;
 }
 
+/**
+ * 在渠道**开始读取**新任务所需状态(旧任务、默认配置)之前捕获当前账号, 返回复核函数:
+ * 账号已变化时抛错。传给 `openChannelSession` 后与 openSession 自己的代次校验一起生效 ——
+ * openSession 只能从它被调用的那一刻起守, 之前的读取窗口要靠调用方更早捕获。
+ */
+export function captureChannelAccount(): () => void {
+  const owner = getCurrentDbClientSnapshot();
+  return () => {
+    if (!owner || getCurrentDbClientSnapshot() !== owner) {
+      throw new Error('账号已变化，请重新新建任务');
+    }
+  };
+}
+
 export async function openChannelSession<T>(
   id: string,
   route: ChannelSessionRoute,
   commit: (admitted: AdmittedChannelRoute, assertCurrent: () => void) => Promise<T>,
+  assertAccount?: () => void,
 ): Promise<T> {
   const body: SessionOpenBody = {
     ...(route.title ? { title: route.title } : {}),
@@ -58,7 +74,9 @@ export async function openChannelSession<T>(
     ...(route.workspaceKind ? { workspaceKind: route.workspaceKind } : {}),
     workingDir: route.workingDir,
   };
-  const { value } = await openSession({ id, body }, async (row, assertCurrent) =>
+  const { value } = await openSession(
+    { id, body, ...(assertAccount ? { assertCurrent: assertAccount } : {}) },
+    async (row, assertCurrent) =>
     commit(
       {
         model: row.model,

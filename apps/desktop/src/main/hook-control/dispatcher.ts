@@ -852,7 +852,8 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
   /**
    * 正在由本端发布客户端终稿的 connectionId + requestId。发布前写下的出箱兜底帧
    * (不带 clientFinal)只为崩溃重启准备: 本进程还在发布时重连, 不能拿它抢先重放,
-   * 否则服务端提前接管、删掉刚落地的终稿段再自己发一遍。发布结束后正常帧照常发送。
+   * 否则服务端提前接管、删掉刚落地的终稿段再自己发一遍。屏障一直保持到正式 turn.end
+   * 进入发送 / 缓冲路径(终稿之后还要等卡片 drain)。
    */
   const publishingClientFinals = new Set<string>();
   /** 每连接最近一次 welcome 宣告的能力集(turn.reopen 的 feature gate)。 */
@@ -1937,7 +1938,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
             delivery: 'pending',
           });
         },
-      ).finally(() => publishingClientFinals.delete(publishingKey));
+      );
       // 带附件的轮次不走本端发布(isClientFinalEligible), 这里的 turnEnd 不含附件。
       if (clientFinal) turnEnd = { ...turnEnd, clientFinal };
     }
@@ -1947,6 +1948,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       // 发布期间换了账号: 与上面的早退同一语义(不再以旧账号回推), 发布前写下的出箱条目
       // 一并作废, 免得换回该账号时被重放。
       if (persistedBeforePublish) markTerminalSent(task.connectionId, task.requestId);
+      publishingClientFinals.delete(publishingKey);
       running.delete(sessionId);
       return;
     }
@@ -1957,6 +1959,9 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       ...terminalRecord,
       turnEnd: durableTurnEnd(turnEnd),
     });
+    // 屏障撤在正式帧进入发送 / 缓冲路径之后: 终稿发完到这里还隔着卡片 drain(最长数秒),
+    // 这段时间重连仍不能拿出箱里的兜底帧抢先重放。
+    publishingClientFinals.delete(publishingKey);
     if (messageLifecycle && finalIntent) {
       messageLifecycle.markFinalSent(finalIntent);
       if (messageLifecycle.beginCleanup()) messageLifecycle.finishCleanup();

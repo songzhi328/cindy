@@ -87,9 +87,10 @@ vi.mock('../../../appSessionState.js', async (importOriginal) => ({
 }));
 
 let db: ReturnType<typeof drizzle>;
-vi.mock('../../../localDb/client/current', () => ({
-  getDbClient: () => ({ drizzle: db }),
-}));
+vi.mock('../../../localDb/client/current', () => {
+  const account = {};
+  return { getDbClient: () => ({ drizzle: db }), getCurrentDbClientSnapshot: () => account };
+});
 
 const { sessions } = await import('../../../localDb/schema');
 const {

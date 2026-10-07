@@ -64,8 +64,10 @@ vi.mock('../../defaultSessionSettings', () => ({
 }));
 
 let db: ReturnType<typeof drizzle>;
+const account = vi.hoisted(() => ({ current: {} as object }));
 vi.mock('../../../localDb/client/current', () => ({
   getDbClient: () => ({ drizzle: db }),
+  getCurrentDbClientSnapshot: () => account.current,
 }));
 
 const { sessions } = await import('../../../localDb/schema');
@@ -253,6 +255,16 @@ describe('新任务写库前复核账号代次', () => {
       return { row, value };
     });
     await expect(repo().createSession('bot1', 'u1')).rejects.toThrow('account changed');
+    expect(await db.select().from(sessions)).toHaveLength(0);
+  });
+
+  it('先 prepare、再 createSession 之间换了账号: 抛错且不写库', async () => {
+    const r = repo();
+    const prepared = await r.prepareNewSession('bot1', 'u1');
+    account.current = {};
+    await expect(r.createSession('bot1', 'u1', undefined, prepared)).rejects.toThrow(
+      '账号已变化',
+    );
     expect(await db.select().from(sessions)).toHaveLength(0);
   });
 });

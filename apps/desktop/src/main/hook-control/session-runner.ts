@@ -110,7 +110,11 @@ import { beginHeadlessGhostSetupTurn } from '../mcp-integrations/ghostSetupInter
 import { observeHookTurn, type HookTurnObserver } from './turnObserver.js';
 import { bindRuntimeRecoveryNotice } from '../im/shared/runtimeRecoveryNotice.js';
 import { beginGroupHistoryAccess } from '../im/shared/groupHistoryAccess.js';
-import { openChannelSession, type ChannelSessionRoute } from '../im/shared/openChannelSession.js';
+import {
+  captureChannelAccount,
+  openChannelSession,
+  type ChannelSessionRoute,
+} from '../im/shared/openChannelSession.js';
 import { describeInteractionSource } from '../im/shared/interactionSource';
 import { groupLaneOf } from './groupWindow';
 
@@ -505,6 +509,9 @@ export function createMakerHookSessionRunner(deps: {
     async run(req) {
       const startedAt = Date.now();
       const maker = getMaker();
+      // 新任务的账号代次从读取偏好 / 默认配置之前算起(与个人 IM 同一判据): 中途换账号时
+      // 不拿旧账号读到的配置去新账号的库里建任务。
+      const assertAccount = req.isNew ? captureChannelAccount() : undefined;
 
       // 新建: 按「偏好 > 草稿默认」合成; 复用/接管: session meta 权威, 下方覆盖
       const resolved = req.isNew
@@ -696,6 +703,7 @@ export function createMakerHookSessionRunner(deps: {
               });
               return admitted.providerId;
             },
+            assertAccount,
           );
           if (admittedProviderId) {
             setSessionProvider(req.sessionId, admittedProviderId);
@@ -736,7 +744,7 @@ export function createMakerHookSessionRunner(deps: {
                 ...(admitted.providerId !== null ? { providerId: admitted.providerId } : {}),
                 ...(admitted.effort !== undefined ? { effort: admitted.effort } : {}),
               });
-            })
+            }, assertAccount)
           : await maker.createSession(createOpts);
       } catch (err) {
         // session 未建成: 若有预建 worktree 则回收(同 maker-ipc/register.ts
