@@ -541,14 +541,16 @@ bot 同一份过程载体与渲染（见 `docs/product-rules/telegram-bot-parity
 - `telegram-final-ops-v1`：普通成功轮次的终稿经 `purpose: 'turn-final'`（`send` 带
   `finalPart`，附件走 `media`）发布；`TurnEndPayload.clientFinal?: { complete }`
   告诉服务端是否全部确认。complete 时服务端不再渲染、提升续跑锚点并做收口副作用；否则
-  删掉已落地的客户端终稿段并照旧自己发布。桌面端发布前先把不带 `clientFinal` 的
+  删掉已落地的客户端终稿段并照旧自己发布。私聊草稿模式下服务端对终稿 op 回
+  `TURN_UNAVAILABLE`（终稿随草稿通道由服务端发布），桌面端按停手码交回。桌面端发布前先把不带 `clientFinal` 的
   `turn.end` 写进持久出箱，崩溃重放走「交回服务端」那一版，终稿必达不降级。
 - `telegram-card-ops-v1`：执行中交互卡经 `purpose: 'interaction-card'`（带
   `interactionId`；收口 `edit` 带 `interactionClosed` 并清空按钮）发布；按钮 token 即
   buttonId，回调仍由服务端转成 `interaction.decision`。协商后桌面端不再为这类卡发
   `interaction.request` / `interaction.cancel`，op 被明确拒绝时才回落旧帧。
 - `telegram-commands-v1`：新增 `provider.commands.set` 帧（默认菜单有且仅有一份，
-  command / description 遵守 Telegram 限制），服务端执行 `setMyCommands`。菜单只存服务端
+  command / description 遵守 Telegram 限制），服务端执行 `setMyCommands`；只管理默认菜单与
+  `zh` / `ja` / `ko`，每次全量重写，其它语言码（含显式 `en`）忽略。菜单只存服务端
   内存、不落库：desktop 每次握手重发，服务端重启后到桌面重连前用服务端默认菜单。
 
 新增拒绝码 `TURN_UNAVAILABLE`（终稿 / 卡片 op 时这一轮已收口或不属于该设备）。`msg.op`

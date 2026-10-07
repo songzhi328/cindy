@@ -468,7 +468,21 @@ describe('官方 Telegram 终稿由客户端发布(turn-final)', () => {
     expect(h.sent).toHaveLength(count);
   });
 
-  it('进度被服务端收回(私聊草稿)后, 终稿仍可由本端发布', async () => {
+  it('私聊草稿模式: 进度与终稿都被收回 → 只试一次终稿 op, 不回落纯文本, 交回服务端', async () => {
+    const h = autoHarness((p) =>
+      p.purpose === 'turn-progress'
+        ? { ok: false, errorCode: MESSAGE_OP_ERROR_PROGRESS_UNAVAILABLE }
+        : { ok: false, errorCode: 'TURN_UNAVAILABLE' },
+    );
+    h.carrier.update('工作中');
+    await advance(THROTTLE_MS);
+    const done = h.carrier.publishFinal({ status: 'ok', finalText: '答案' });
+    await advance(0);
+    await expect(done).resolves.toBe(false);
+    expect(h.sent.filter((m) => m.payload.purpose === 'turn-final')).toHaveLength(1);
+  });
+
+  it('进度被服务端收回后, 终稿是否可发由终稿 op 自己的回执决定(本端不预判)', async () => {
     const h = autoHarness((p) =>
       p.purpose === 'turn-progress'
         ? { ok: false, errorCode: MESSAGE_OP_ERROR_PROGRESS_UNAVAILABLE }
